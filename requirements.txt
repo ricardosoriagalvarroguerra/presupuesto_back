@@ -1,0 +1,21 @@
+# Dependencias de producción. Railway/Nixpacks detecta este archivo y corre
+# `pip install -r requirements.txt` automáticamente. Sincronizado con
+# pyproject.toml. Si agregás una librería, actualizá ambos.
+fastapi>=0.115
+uvicorn[standard]>=0.32
+sqlalchemy>=2.0
+asyncpg>=0.30
+psycopg2-binary>=2.9
+alembic>=1.13
+pydantic>=2.9
+pydantic-settings>=2.6
+python-jose[cryptography]>=3.3
+passlib[bcrypt]>=1.7
+bcrypt>=4.0
+pyotp>=2.9
+python-multipart>=0.0.12
+openpyxl>=3.1
+python-docx>=1.1
+greenlet>=3.0
+httpx>=0.27
+python-dotenv>=1.0

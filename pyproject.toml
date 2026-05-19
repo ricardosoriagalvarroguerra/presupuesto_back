@@ -1,0 +1,59 @@
+[project]
+name = "sistema-presupuesto-backend"
+version = "0.1.0"
+description = "Backend API for Sistema de Gestión Presupuestaria — FONPLATA"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "sqlalchemy>=2.0",
+  "asyncpg>=0.30",
+  "psycopg2-binary>=2.9",
+  "alembic>=1.13",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  "python-jose[cryptography]>=3.3",
+  "passlib[bcrypt]>=1.7",
+  "pyotp>=2.9",
+  "python-multipart>=0.0.12",
+  "openpyxl>=3.1",
+  "python-docx>=1.1",
+  "greenlet>=3.0",
+  "httpx>=0.27",
+  "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=5",
+  "ruff>=0.7",
+  "mypy>=1.13",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "B", "W", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Loop por sesión: el AsyncEngine de SQLAlchemy mantiene un pool global
+# atado al loop donde se creó. Si pytest-asyncio crea un loop nuevo por test,
+# las conexiones quedan huérfanas → RuntimeError: Event loop is closed.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]
