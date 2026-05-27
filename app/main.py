@@ -26,14 +26,17 @@ logger = logging.getLogger(__name__)
 # Middleware: headers de seguridad estándar
 # ============================================================================
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Aplica headers que TI marca como mandatorios (OWASP A05).
+    """Agrega los headers de seguridad estándar OWASP A05.
 
-    - CSP estricto (sin scripts inline; conexión solo al mismo origen + backend dev)
-    - X-Frame-Options DENY (clickjacking)
-    - X-Content-Type-Options nosniff (MIME sniffing)
-    - Referrer-Policy same-origin (no fugas al referer)
-    - Strict-Transport-Security (solo si app_env=production, sino rompe localhost)
-    - Permissions-Policy restrictivo
+    Cada header está por una razón puntual:
+      X-Frame-Options DENY     → bloquea clickjacking (no nos embeben en iframe).
+      X-Content-Type-Options   → MIME sniffing off, el browser respeta el Content-Type.
+      Referrer-Policy          → no filtramos URLs internas al hacer link out.
+      Permissions-Policy       → desactivamos geo/cam/mic/payment que la SPA no usa.
+      CSP                      → relajado en dev (unsafe-inline para Vite HMR);
+                                  endurecer al ir a prod (sacar inline, agregar nonce).
+      HSTS                     → solo en producción. En dev rompe localhost
+                                  porque el browser cachea HSTS y queda HTTPS-only.
     """
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
@@ -42,10 +45,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "same-origin"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=(), payment=()"
         # CSP relativamente permisivo para la SPA dev — endurecer en producción.
+        # CSP: 'unsafe-inline' en script y style es necesario para Vite HMR en dev.
+        # Las fonts ya no necesitan permiso a fonts.gstatic.com — están auto-hosteadas
+        # vía @fontsource (ver frontend/src/main.tsx). connect-src apunta solo al
+        # mismo origen + el backend dev local.
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
             "script-src 'self' 'unsafe-inline'; "
             "style-src 'self' 'unsafe-inline'; "
+            "font-src 'self' data:; "
             "img-src 'self' data:; "
             "connect-src 'self' http://localhost:8000 http://localhost:5173; "
             "frame-ancestors 'none'; "
@@ -60,14 +68,25 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 # Middleware: rate-limit in-memory para endpoints sensibles
 # ============================================================================
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Rate-limit token-bucket simple, en memoria, por IP+path.
+    """Rate-limit token-bucket por IP+path en memoria del proceso.
 
-    Limita el login para mitigar brute force. Para producción real conviene
-    Redis + slowapi/limits, pero esto cubre el caso TI mientras no haya cluster.
+    Pensado para frenar brute force en /auth/login. Limitaciones conocidas:
+
+    1) NO es cluster-safe. Cada proceso tiene su propio bucket; con N réplicas
+       el atacante consigue N veces el límite efectivo. Para deploy multi-
+       instancia, migrar a Redis con slowapi/limits (paquete `slowapi`).
+       La migración es mecánica: cambiar el backing store de `self._hits` a
+       Redis y leer la URL de `os.environ["REDIS_URL"]`. Hasta que esto sea
+       necesario (deploy en cluster real), el ahorro de complejidad justifica
+       quedarse con la versión en memoria.
+
+    2) No protege contra DDoS distribuido: una botnet con muchas IPs se
+       pasa por el costado. Esto se mitiga a nivel de WAF / CDN, no de app.
     """
-    # path → (max_requests, window_seconds). En production se aplica la
-    # política estricta de TI; en development se afloja porque desarrollo
-    # comparte 127.0.0.1 con tests/pruebas manuales y el bucket se llena.
+    # path → (max_requests, window_seconds). El umbral de production es bajo
+    # para frenar ataques de fuerza bruta; en development se eleva porque
+    # todas las requests salen desde 127.0.0.1 y el bucket se llena rápido
+    # con pruebas manuales.
     LIMITS_PROD: dict[str, tuple[int, int]] = {
         "/auth/login": (5, 60 * 15),  # 5 intentos por 15 min por IP
     }
@@ -123,11 +142,18 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     settings = get_settings()
+    # En producción se desactivan /docs, /redoc y /openapi.json para no
+    # exponer el schema. En dev quedan habilitados para poder probar
+    # endpoints desde Swagger UI.
+    is_prod = settings.app_env == "production"
     app = FastAPI(
         title="Sistema de Gestión Presupuestaria — API",
         version="0.1.0",
         description="API para el sistema presupuestario de FONPLATA.",
         lifespan=lifespan,
+        docs_url=None if is_prod else "/docs",
+        redoc_url=None if is_prod else "/redoc",
+        openapi_url=None if is_prod else "/openapi.json",
     )
     # Orden: rate limit → security headers → CORS (último visible al cliente)
     app.add_middleware(RateLimitMiddleware)

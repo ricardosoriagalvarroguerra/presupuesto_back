@@ -26,9 +26,11 @@ from app.schemas.catalogo import (
     TipoMovimientoOut,
 )
 
-# Datos maestros: visibles para cualquier usuario autenticado (no se filtran
-# por VP — todos los planificadores necesitan el mismo catálogo). La auth se
-# aplica una vez a nivel router para cerrar todo el módulo en bloque.
+# Datos maestros: el router exige auth (dependencies=[Depends(get_current_user)])
+# pero NO filtra por VP — los SELECT devuelven todo el catálogo independiente
+# del usuario. Si en algún momento hay que restringir por scope, el cambio va
+# acá: agregar `current: CurrentUser = Depends(get_current_user)` a cada
+# endpoint y filtrar en el WHERE de la query correspondiente.
 router = APIRouter(
     prefix="/catalogo",
     tags=["catalogo"],
@@ -82,7 +84,7 @@ async def list_objetivos(db: AsyncSession = Depends(get_db)) -> list[dict]:
         text(
             """SELECT id, codigo, nombre, orden, activo
                  FROM catalogo.objetivo_estrategico
-                WHERE activo = true
+                WHERE activo = 1
                 ORDER BY orden, codigo"""
         )
     )).mappings().all()
@@ -98,9 +100,16 @@ async def list_items(
 ):
     stmt = select(ItemPlanificacion).order_by(ItemPlanificacion.codigo)
     if path:
-        # ltree: <@ con ancestor; ~ con lquery (acepta wildcards). Detectamos por '*'.
-        op = "~" if "*" in path else "<@"
-        stmt = stmt.where(text(f"path {op} CAST(:p AS lquery)" if op == "~" else f"path {op} CAST(:p AS ltree)").bindparams(p=path))
+        # Antes: ltree (<@ ancestor, ~ lquery). En SQL Server `path` es
+        # NVARCHAR — emulamos:
+        #   - sin wildcard `*`: descendiente o igual → path = :p OR path LIKE :p + '.%'
+        #   - con `*`: lquery → reemplazamos `*` por `%` y usamos LIKE.
+        if "*" in path:
+            stmt = stmt.where(text("path LIKE :p").bindparams(p=path.replace("*", "%")))
+        else:
+            stmt = stmt.where(
+                text("(path = :p OR path LIKE :p + '.%')").bindparams(p=path)
+            )
     if imputable is not None:
         stmt = stmt.where(ItemPlanificacion.imputable == imputable)
     if tipo:
@@ -117,8 +126,13 @@ async def list_cuentas(
 ):
     stmt = select(CuentaPlanificacion).order_by(CuentaPlanificacion.codigo)
     if path:
-        op = "~" if "*" in path else "<@"
-        stmt = stmt.where(text(f"path {op} CAST(:p AS lquery)" if op == "~" else f"path {op} CAST(:p AS ltree)").bindparams(p=path))
+        # Ver list_items() — misma emulación ltree → LIKE en NVARCHAR.
+        if "*" in path:
+            stmt = stmt.where(text("path LIKE :p").bindparams(p=path.replace("*", "%")))
+        else:
+            stmt = stmt.where(
+                text("(path = :p OR path LIKE :p + '.%')").bindparams(p=path)
+            )
     if imputable is not None:
         stmt = stmt.where(CuentaPlanificacion.imputable == imputable)
     if modalidad:
@@ -158,7 +172,7 @@ async def cuentas_validas_para_item(item_id: int, db: AsyncSession = Depends(get
 
 @router.get("/relacion-item-cuenta")
 async def relacion_item_cuenta(db: AsyncSession = Depends(get_db)) -> list[dict[str, str]]:
-    """Matriz completa item ↔ cuenta del Excel `relaciones.xlsx`.
+    """Matriz completa item ↔ cuenta.
 
     Es la fuente de verdad para validar qué combinación de unidad y cuenta es válida.
     El frontend la usa para filtrar el dropdown 'Unidad' según las cuentas de la planilla activa.
@@ -280,18 +294,22 @@ async def mapa_relaciones(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
                   i.imputable,
                   i.tipo_presupuesto,
                   i.k2b_item_id,
-                  -- Gestor canónico: el primero asociado al item (es 1-a-1 según relaciones.xlsx).
+                  -- Gestor canónico: el primero asociado al item (la relación es 1-a-1 por diseño).
                   -- COALESCE busca también heredado del padre (las áreas 02.03.* heredan el gestor de 02.03).
                   COALESCE(
-                    (SELECT g.nombre FROM catalogo.gestor_item gi
+                    (SELECT TOP 1 g.nombre FROM catalogo.gestor_item gi
                        JOIN catalogo.gestor g ON g.id = gi.gestor_id
-                       WHERE gi.item_id = i.id LIMIT 1),
-                    (SELECT g.nombre FROM catalogo.gestor_item gi
+                       WHERE gi.item_id = i.id),
+                    (SELECT TOP 1 g.nombre FROM catalogo.gestor_item gi
                        JOIN catalogo.gestor g ON g.id = gi.gestor_id
-                       WHERE gi.item_id = i.parent_id LIMIT 1)
+                       WHERE gi.item_id = i.parent_id)
                   ) AS gestor_nombre
                 FROM catalogo.item_planificacion i
-                WHERE i.codigo ~ '^[0-9]{2}(\\.[0-9]{2}){0,2}$'
+                -- MSSQL no tiene operador regex `~`; reemplazo con 3 patrones
+                -- LIKE para captar exactamente "NN", "NN.NN" y "NN.NN.NN".
+                WHERE i.codigo LIKE '[0-9][0-9]'
+                   OR i.codigo LIKE '[0-9][0-9].[0-9][0-9]'
+                   OR i.codigo LIKE '[0-9][0-9].[0-9][0-9].[0-9][0-9]'
                 ORDER BY i.codigo
             """)
         )

@@ -1,3 +1,17 @@
+"""Modelos del schema `core` — datos institucionales: usuarios, roles, monedas, ciclos.
+
+Estructura:
+  Moneda               código ISO de moneda.
+  TipoCambio           FX por par moneda × fecha.
+  Rol                  roles del sistema (vicepresidente, jefe_unidad, etc.).
+  Usuario              usuarios + flags para MFA y cross-VP.
+  UsuarioRol           N a N usuarios ↔ roles.
+  CicloPresupuestario  un registro por año presupuestario.
+  Periodo              sub-períodos del ciclo (semestre/trimestre/mes).
+
+Nota sobre IDs: la mayoría son INT pero `usuario.id` es BIGINT por
+compatibilidad con datos importados; los FKs hacia usuario también son BIGINT.
+"""
 from datetime import date, datetime
 
 from sqlalchemy import (
@@ -71,8 +85,8 @@ class Usuario(Base):
     # token scope='pwd_change' que solo sirve para /auth/cambiar-password.
     requiere_cambio_password: Mapped[bool] = mapped_column(Boolean, default=False)
     ultimo_login: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"))
 
     roles: Mapped[list[Rol]] = relationship(secondary="core.usuario_rol")
 
@@ -100,7 +114,7 @@ class CicloPresupuestario(Base):
         default="planificacion",
     )
     created_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("core.usuario.id"), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"))
 
 
 class Periodo(Base):

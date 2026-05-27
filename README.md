@@ -1,16 +1,18 @@
 # Sistema de Gestión Presupuestaria — Backend
 
-API REST async (FastAPI + SQLAlchemy 2 + PostgreSQL) que soporta el flujo de
+API REST async (FastAPI + SQLAlchemy 2 + SQL Server) que soporta el flujo de
 planificación, aprobación por Vicepresidente, Presidencia y cierre de
 solicitudes presupuestarias.
 
 ## Stack
 
 - Python 3.11+ · FastAPI 0.115 · Uvicorn
-- SQLAlchemy 2.0 (async, asyncpg) · Alembic
+- SQLAlchemy 2.0 (async, aioodbc / pyodbc) · Alembic
 - Pydantic 2 · python-jose (JWT) · bcrypt · pyotp (MFA TOTP)
 - pytest + pytest-asyncio (28 tests)
-- PostgreSQL 14+ con extensión `ltree`
+- SQL Server 2019+ con "ODBC Driver 18 for SQL Server" instalado en el host.
+  Las jerarquías de cuenta/ítem (antes `ltree` en PG) viven ahora en columnas
+  `NVARCHAR(255)` y se filtran con `LIKE` prefijo (ver `app/api/catalogo.py`).
 
 ## Setup local
 
@@ -25,29 +27,24 @@ cp .env.example .env
 
 ### Base de datos
 
-```sql
-CREATE DATABASE presupuesto2027;
-\c presupuesto2027
-CREATE SCHEMA IF NOT EXISTS core;
-CREATE SCHEMA IF NOT EXISTS catalogo;
-CREATE SCHEMA IF NOT EXISTS planificacion;
-CREATE SCHEMA IF NOT EXISTS workflow;
-CREATE SCHEMA IF NOT EXISTS ejecucion;
-CREATE SCHEMA IF NOT EXISTS analisis;
-CREATE SCHEMA IF NOT EXISTS auditoria;
-CREATE SCHEMA IF NOT EXISTS integracion_k2b;
-CREATE EXTENSION IF NOT EXISTS ltree;
-```
+El DDL para SQL Server fue migrado desde Postgres (ver `migracion_sqlserver/`).
+Si tenés que rearmar una instancia nueva, ejecutá el DDL exportado:
 
 ```bash
-alembic upgrade head    # aplica las 32 migraciones
+# 1) Crear la BD y los schemas, y aplicar el DDL (tablas, FKs, CHECKs, índices).
+sqlcmd -S localhost,1433 -U sa -P 'Fonplata2027!' -Q "CREATE DATABASE presupuesto2027"
+sqlcmd -S localhost,1433 -U sa -P 'Fonplata2027!' -d presupuesto2027 \
+       -i ../migracion_sqlserver/ddl_sqlserver.sql
 
-# Bootstrap de passwords reales (solo entornos NUEVOS — en Railway no hace
-# falta, los hashes vienen del pg_dump). Ver scripts/seed_users.py.
-export FONPLATA_PWD_MMEDNIK='...'
-# ... resto de usuarios
-python -m scripts.seed_users
+# 2) (opcional) cargar datos desde el PG origen — ver migracion_sqlserver/migrate.py.
+
+# 3) Marcar Alembic como ya aplicado (el baseline 001_baseline_mssql es un
+#    upgrade vacío — el DDL real lo aplicó el paso anterior).
+alembic stamp head
 ```
+
+Una vez la BD existe y Alembic está stampeado, las migraciones nuevas (002+)
+se aplican normalmente con `alembic upgrade head`.
 
 ## Run
 
@@ -65,20 +62,21 @@ ruff check .    # linter
 mypy app/       # type checker
 ```
 
-## Deploy a Railway
+## Deploy
 
-Railway detecta automáticamente `requirements.txt` y `start.sh`
-(`railway.json` + `Procfile`). `start.sh` corre `alembic upgrade head` antes
-de levantar uvicorn en el `$PORT` que Railway asigna.
+`start.sh` corre `alembic upgrade head` antes de levantar uvicorn en el
+puerto definido por `$PORT` (default 8000). Apto para correrlo bajo cualquier
+orquestador que pueda ejecutar un shell script y exponer un puerto:
+systemd, supervisor, docker, k8s, etc.
 
-### Variables mínimas a configurar en Railway
+### Variables mínimas
 
 | Variable | Detalle |
 |---|---|
-| `DATABASE_URL` | Inyectada automática al conectar el plugin Postgres. Acepta `postgresql://...`; el código lo normaliza a `postgresql+asyncpg://`. |
+| `DATABASE_URL` | DSN SQL Server. Acepta `mssql://...`, `mssql+aioodbc://...`, `mssql+pyodbc://...` o una cadena ODBC nativa (`Driver={...};Server=...;...`). El código normaliza al driver async (aioodbc) y deriva el sync (pyodbc) para Alembic. |
 | `APP_SECRET_KEY` | Generar con `python -c "import secrets; print(secrets.token_urlsafe(48))"`. **Rotar antes del go-live**. |
-| `APP_ENV` | `production` (activa HSTS). |
-| `APP_CORS_ORIGINS` | Dominio público del frontend (ej. `https://presupuesto-front.up.railway.app`). |
+| `APP_ENV` | `production` (activa HSTS, cierra `/docs`). |
+| `APP_CORS_ORIGINS` | Dominio público del frontend (lista separada por comas). |
 
 Ver `.env.example` para el set completo.
 
@@ -91,18 +89,15 @@ backend/
 │   ├── domain/          # Reglas de negocio (authz, calculo, enums)
 │   ├── models/          # SQLAlchemy models
 │   ├── schemas/         # Pydantic I/O
-│   ├── config.py        # Settings (pydantic-settings) — normaliza DSN para Railway
+│   ├── config.py        # Settings (pydantic-settings) — normaliza el DSN de la BDR
 │   ├── db.py            # Engine + Session factory async
 │   ├── main.py          # FastAPI app factory + middlewares (rate-limit, security headers, CORS)
 │   └── security.py      # JWT + get_current_user
-├── alembic/             # Migraciones DDL versionadas (32)
-├── scripts/             # Tooling fuera-de-banda (seed_users.py)
+├── alembic/             # Migraciones DDL versionadas (baseline + nuevas)
 ├── tests/               # pytest
 ├── requirements.txt     # Deps producción
 ├── pyproject.toml       # Deps + tooling dev
-├── start.sh             # Entry point Railway
-├── railway.json         # Config Railway (NIXPACKS + healthcheck /health)
-└── Procfile             # Fallback Heroku-style
+└── start.sh             # Entry point (alembic upgrade head + uvicorn)
 ```
 
 ## Seguridad

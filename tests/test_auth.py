@@ -1,15 +1,3 @@
-"""Tests de autenticación.
-
-Cubren los casos que TI tipicamente exige verificar:
-  - login OK + estructura de respuesta
-  - login con password incorrecta → 401 genérico (no filtrar si user existe)
-  - login con usuario inexistente → 401 genérico (misma respuesta)
-  - login con body inválido → 422 con detalle de validación
-  - /auth/me sin token → 401
-  - /auth/me con token inválido → 401
-  - rate-limit en /auth/login dispara 429 tras N intentos fallidos
-  - extra="forbid" rechaza campos no declarados
-"""
 import asyncio
 
 import pytest

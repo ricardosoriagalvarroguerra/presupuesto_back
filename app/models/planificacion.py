@@ -1,14 +1,28 @@
-"""Modelos ORM del schema `planificacion`.
+"""Modelos del schema `planificacion` — la parte transaccional del sistema.
 
-Fuente única de verdad para SQLAlchemy. Antes el schema vivía solo como SQL
-crudo en las migraciones (007, 010, 011, 026), lo que rompía `alembic
-autogenerate` y bloqueaba el uso de relationships tipados. Estos modelos
-mapean exactamente las tablas reales (verificado contra `\\d` en la BD).
+Tablas (en orden de relación):
+  Solicitud            paquete de cargado para (ciclo, VP). Única por (ciclo, VP).
+  LineaSolicitud       cada renglón cargado (item × cuenta + monto + params).
+  EventoSolicitud      audit log inmutable de las acciones (append-only).
+  Observacion          notas del revisor (VP/Presidencia) hacia el cargador.
+  SnapshotSolicitud    foto inmutable del estado en un hito del workflow.
+  SnapshotLinea        foto de cada línea dentro de un snapshot.
+  AdjuntoLinea         archivos PDF/Word/Excel justificativos.
+
+Estos modelos son la fuente de verdad para SQLAlchemy (originalmente el
+schema vivía solo en migraciones Alembic como SQL crudo, lo que impedía
+usar autogenerate y relationships tipados).
+
+Tipos: `JSONB` de PG → `JSON` de SQLAlchemy → `NVARCHAR(MAX)` en MSSQL.
+Los operadores `?` y `@>` de PG no existen en MSSQL; para leer un campo
+puntual se usa `JSON_VALUE(col, '$.key')` (ver queries de
+`eliminar_lineas_grupo` en `api/solicitudes.py`).
 """
 from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     DateTime,
@@ -22,7 +36,6 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -66,8 +79,8 @@ class Solicitud(Base):
     created_by: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("core.usuario.id", ondelete="SET NULL"), nullable=True
     )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"), nullable=False)
     enviado_a_revision_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     aprobado_objetivos_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # legacy
     aprobado_vp_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # mig 030
@@ -106,7 +119,7 @@ class LineaSolicitud(Base):
     plan_id: Mapped[int] = mapped_column(Integer, nullable=False)
     modalidad: Mapped[str] = mapped_column(String(16), nullable=False)  # 'parametrizada' | 'directa'
     formula_codigo: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    parametros: Mapped[dict | None] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
+    parametros: Mapped[dict | None] = mapped_column(JSON, server_default=text("'{}'"))
     monto_solicitado: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False, server_default=text("0"))
     monto_objetivos: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)   # legacy
     monto_vp: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)          # mig 030
@@ -123,8 +136,8 @@ class LineaSolicitud(Base):
     updated_by: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("core.usuario.id", ondelete="SET NULL"), nullable=True
     )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"), nullable=False)
 
     solicitud: Mapped[Solicitud] = relationship(back_populates="lineas")
     adjuntos: Mapped[list["AdjuntoLinea"]] = relationship(
@@ -168,12 +181,12 @@ class EventoSolicitud(Base):
     etapa_nueva: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     estado_anterior: Mapped[str | None] = mapped_column(String(32), nullable=True)
     estado_nuevo: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     usuario_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("core.usuario.id", ondelete="SET NULL"), nullable=True
     )
     comentario: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"), nullable=False)
 
     solicitud: Mapped[Solicitud] = relationship(back_populates="eventos")
 
@@ -203,7 +216,7 @@ class Observacion(Base):
              name="observacion_accion", schema="planificacion"),
         nullable=True,
     )
-    valor_sugerido: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    valor_sugerido: Mapped[dict] = mapped_column(JSON, nullable=False, server_default=text("'{}'"))
     estado: Mapped[str] = mapped_column(
         Enum("abierta", "aplicada", "rechazada", name="observacion_estado", schema="planificacion"),
         nullable=False, server_default=text("'abierta'"),
@@ -212,7 +225,7 @@ class Observacion(Base):
     created_by: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("core.usuario.id", ondelete="SET NULL"), nullable=True
     )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"), nullable=False)
     resuelta_por: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("core.usuario.id", ondelete="SET NULL"), nullable=True
     )
@@ -240,7 +253,7 @@ class AdjuntoLinea(Base):
     subido_por: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("core.usuario.id", ondelete="SET NULL"), nullable=True
     )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"), nullable=False)
 
     linea: Mapped[LineaSolicitud] = relationship(back_populates="adjuntos")
 
@@ -267,7 +280,7 @@ class SnapshotSolicitud(Base):
     created_by: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("core.usuario.id", ondelete="SET NULL"), nullable=True
     )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"), nullable=False)
 
     solicitud: Mapped[Solicitud] = relationship(back_populates="snapshots")
     lineas: Mapped[list["SnapshotLinea"]] = relationship(
@@ -287,7 +300,7 @@ class SnapshotLinea(Base):
     item_codigo: Mapped[str | None] = mapped_column(String(40), nullable=True)
     cuenta_codigo: Mapped[str | None] = mapped_column(String(40), nullable=True)
     plan_codigo: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    parametros: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    parametros: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     monto_solicitado: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
     monto_objetivos: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
     monto_presidencia: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
@@ -309,4 +322,4 @@ class UsuarioPlanillaExtra(Base):
     )
     planilla_codigo: Mapped[str] = mapped_column(String(64), primary_key=True)
     # FK declarada en migración 026 contra catalogo.planilla_template(codigo)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"), nullable=False)

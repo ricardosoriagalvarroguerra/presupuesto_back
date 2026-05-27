@@ -1,8 +1,23 @@
-"""Endpoints de planificación: workflows por VP × ciclo + desgloses."""
+"""Endpoints del módulo Planificación — workflows agregados y desgloses por VP.
+
+Este router contesta tres preguntas:
+  1) ¿Qué workflows hay en la institución? (uno por (ciclo, VP))
+     GET /workflows  → lista para el dashboard de planificación
+     GET /workflows-institucionales → versión consolidada para análisis
+  2) ¿Cómo está la VP X en el ciclo Y? (resumen agregado por categoría)
+     GET /workflows/{anio}/{vp}/resumen
+  3) ¿Qué pidieron las líneas de planificación, desglosado por item × cuenta?
+     GET /avance
+     GET /avance/lineas
+
+"workflow" acá es un concepto agregado (un par ciclo × VP), no una máquina
+de estados ni la solicitud propiamente dicha — un workflow puede contener
+0, 1 o varias solicitudes en distintos estados.
+"""
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
@@ -49,24 +64,25 @@ async def listar_workflows(
             cp.anio,
             cp.estado AS ciclo_estado,
             m.vp_codigo AS vp,
-            ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END)::numeric, 0) AS aprobado,
-            ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END)::numeric, 0) AS ejecutado,
+            ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END), 0) AS aprobado,
+            ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END), 0) AS ejecutado,
             COUNT(*) AS movimientos,
             MAX(m.fecha_movimiento) AS ultima_actualizacion
           FROM ejecucion.movimiento_dedup m
           JOIN core.ciclo_presupuestario cp ON cp.id = m.ciclo_id
           JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
           JOIN (
-            SELECT EXTRACT(YEAR FROM fecha_movimiento)::int AS anio,
+            SELECT YEAR(fecha_movimiento) AS anio,
                    MAX(snapshot_label) AS snap
-            FROM ejecucion.movimiento GROUP BY 1
-          ) lsy ON lsy.anio = EXTRACT(YEAR FROM m.fecha_movimiento)
+            FROM ejecucion.movimiento GROUP BY YEAR(fecha_movimiento)
+          ) lsy ON lsy.anio = YEAR(m.fecha_movimiento)
                AND lsy.snap = m.snapshot_label
           WHERE m.vp_codigo IS NOT NULL
           GROUP BY cp.id, cp.anio, cp.estado, m.vp_codigo
         )
         SELECT * FROM agg
-        ORDER BY anio DESC, aprobado DESC NULLS LAST
+        -- SQL Server pone NULLs primero en DESC; el CASE lo invierte → NULLs al final.
+        ORDER BY anio DESC, CASE WHEN aprobado IS NULL THEN 1 ELSE 0 END, aprobado DESC
     """)
     rows = (await db.execute(sql)).mappings().all()
     out = []
@@ -124,16 +140,16 @@ async def resumen_workflow_vp(
     # Cabecera con totales para esta VP × ciclo
     head_sql = text("""
         SELECT
-          ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END)::numeric, 0) AS aprobado,
-          ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END)::numeric, 0) AS ejecutado,
+          ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END), 0) AS aprobado,
+          ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END), 0) AS ejecutado,
           COUNT(*) AS movimientos
         FROM ejecucion.movimiento_dedup m
         JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
         JOIN (
-          SELECT EXTRACT(YEAR FROM fecha_movimiento)::int AS anio,
+          SELECT YEAR(fecha_movimiento) AS anio,
                  MAX(snapshot_label) AS snap
-          FROM ejecucion.movimiento GROUP BY 1
-        ) lsy ON lsy.anio = EXTRACT(YEAR FROM m.fecha_movimiento)
+          FROM ejecucion.movimiento GROUP BY YEAR(fecha_movimiento)
+        ) lsy ON lsy.anio = YEAR(m.fecha_movimiento)
              AND lsy.snap = m.snapshot_label
         WHERE m.ciclo_id = :ciclo_id AND m.vp_codigo = :vp
     """)
@@ -153,13 +169,16 @@ async def resumen_workflow_vp(
           FROM ejecucion.movimiento_dedup m
           JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
           JOIN (
-            SELECT EXTRACT(YEAR FROM fecha_movimiento)::int AS anio,
+            SELECT YEAR(fecha_movimiento) AS anio,
                    MAX(snapshot_label) AS snap
-            FROM ejecucion.movimiento GROUP BY 1
-          ) lsy ON lsy.anio = EXTRACT(YEAR FROM m.fecha_movimiento)
+            FROM ejecucion.movimiento GROUP BY YEAR(fecha_movimiento)
+          ) lsy ON lsy.anio = YEAR(m.fecha_movimiento)
                AND lsy.snap = m.snapshot_label
           JOIN catalogo.cuenta_planificacion c ON c.id = m.cuenta_id
-          LEFT JOIN catalogo.cuenta_planificacion c3 ON c3.nivel = 3 AND c.path <@ c3.path
+          -- ltree `<@` (descendiente o igual) → comparación con LIKE prefijo.
+          LEFT JOIN catalogo.cuenta_planificacion c3
+                 ON c3.nivel = 3
+                AND (c.path = c3.path OR c.path LIKE c3.path + '.%')
           WHERE m.ciclo_id = :ciclo_id AND m.vp_codigo = :vp
         )
         SELECT
@@ -167,8 +186,8 @@ async def resumen_workflow_vp(
           categoria_codigo,
           cuenta_codigo,
           cuenta,
-          ROUND(SUM(aprobado)::numeric, 0) AS aprobado,
-          ROUND(SUM(ejecutado)::numeric, 0) AS ejecutado
+          ROUND(SUM(aprobado), 0) AS aprobado,
+          ROUND(SUM(ejecutado), 0) AS ejecutado
         FROM base
         GROUP BY categoria, categoria_codigo, cuenta_codigo, cuenta
         HAVING SUM(aprobado) > 0
@@ -231,7 +250,7 @@ async def workflows_institucionales(
         LEFT JOIN ejecucion.movimiento_dedup m ON m.ciclo_id = cp.id
           AND m.snapshot_label = (SELECT MAX(snapshot_label)
                                   FROM ejecucion.movimiento m2
-                                  WHERE EXTRACT(YEAR FROM m2.fecha_movimiento) = cp.anio)
+                                  WHERE YEAR(m2.fecha_movimiento) = cp.anio)
         LEFT JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
         GROUP BY cp.id, cp.anio, cp.nombre, cp.estado
         ORDER BY anio DESC
@@ -256,6 +275,9 @@ def _alcance_avance_sql(vp_codigo: str | None, planillas_extra: list[str] | None
 
     Helper único compartido entre `/avance` y `/avance/lineas` para evitar
     drift entre los dos endpoints (regla cross-VP en un solo lugar).
+
+    Si hay `planillas_extra`, devuelve la lista en `params["pextra"]` para que
+    el caller la pase con `bindparam("pextra", expanding=True)`.
     """
     params: dict[str, Any] = {}
     if not vp_codigo:
@@ -267,12 +289,20 @@ def _alcance_avance_sql(vp_codigo: str | None, planillas_extra: list[str] | None
             " AND (s.vp_codigo = :vp OR EXISTS ("
             "  SELECT 1 FROM planificacion.linea_solicitud l2"
             "  JOIN catalogo.planilla_template pt ON pt.id = l2.planilla_template_id"
-            "  WHERE l2.solicitud_id = s.id AND pt.codigo = ANY(:pextra)"
+            "  WHERE l2.solicitud_id = s.id AND pt.codigo IN :pextra"
             "))",
             params,
         )
     params["vp"] = vp_codigo
     return " AND s.vp_codigo = :vp", params
+
+
+def _bind_expanding_pextra(stmt, params: dict[str, Any]):
+    """Si la query consume :pextra, lo declaramos `expanding` para que
+    SQLAlchemy lo materialice como un IN (?, ?, ?) compatible con SQL Server."""
+    if "pextra" in params:
+        return stmt.bindparams(bindparam("pextra", expanding=True))
+    return stmt
 
 
 @router.get("/avance")
@@ -300,6 +330,9 @@ async def avance(
     scope_sql, scope_params = _alcance_avance_sql(effective_vp, planillas_extra)
     params: dict[str, Any] = {"anio": ciclo_anio, **scope_params}
 
+    # `subpath(path, 0, N)` (ltree) → ancestro de nivel N. Como cn2/cn3 ya tienen
+    # `nivel=N`, alcanza con la relación de ancestro: c.path = cnN.path o
+    # c.path empieza con cnN.path + '.' (lo mismo que `c.path <@ cnN.path` en PG).
     sql = f"""
         SELECT
           i.codigo  AS item_codigo,
@@ -308,22 +341,25 @@ async def avance(
           cn3.codigo AS cn3_codigo, cn3.descripcion AS cn3_desc,
           c.codigo  AS cuenta_codigo,
           c.descripcion AS cuenta_desc,
-          SUM(l.monto_solicitado)::float AS total
+          CAST(SUM(l.monto_solicitado) AS FLOAT) AS total
         FROM planificacion.linea_solicitud l
         JOIN planificacion.solicitud s ON s.id = l.solicitud_id
         JOIN core.ciclo_presupuestario cp ON cp.id = s.ciclo_id
         JOIN catalogo.item_planificacion i ON i.id = l.item_id
         JOIN catalogo.cuenta_planificacion c ON c.id = l.cuenta_id
         LEFT JOIN catalogo.cuenta_planificacion cn2
-               ON cn2.nivel = 2 AND cn2.path = subpath(c.path, 0, 2)
+               ON cn2.nivel = 2
+              AND (c.path = cn2.path OR c.path LIKE cn2.path + '.%')
         LEFT JOIN catalogo.cuenta_planificacion cn3
-               ON cn3.nivel = 3 AND cn3.path = subpath(c.path, 0, 3)
+               ON cn3.nivel = 3
+              AND (c.path = cn3.path OR c.path LIKE cn3.path + '.%')
         WHERE cp.anio = :anio{scope_sql}
         GROUP BY i.codigo, i.descripcion, cn2.codigo, cn2.descripcion,
                  cn3.codigo, cn3.descripcion, c.codigo, c.descripcion
         ORDER BY i.codigo, cn2.codigo, cn3.codigo, c.codigo
     """
-    rows = (await db.execute(text(sql), params)).mappings().all()
+    stmt = _bind_expanding_pextra(text(sql), params)
+    rows = (await db.execute(stmt, params)).mappings().all()
     return {
         "ciclo_anio": ciclo_anio,
         "vp_codigo": vp_codigo,
@@ -356,13 +392,18 @@ async def avance_lineas(
     # pero acá usamos lista de wheres, así que tomamos el contenido).
     if scope_sql:
         where.append(scope_sql.lstrip().removeprefix("AND ").strip())
-    # Filtro por nivel de cuenta usando ltree (path <@ ancestor)
+    # Filtro por nivel de cuenta — ltree `<@` (descendiente o igual) emulado
+    # con LIKE prefijo sobre la columna NVARCHAR `path`.
     if cuenta_imputable_codigo:
         where.append("c.codigo = :ckey")
         params["ckey"] = cuenta_imputable_codigo
     elif cn3_codigo or cn2_codigo:
         ancestro = cn3_codigo or cn2_codigo
-        where.append("c.path <@ (SELECT path FROM catalogo.cuenta_planificacion WHERE codigo = :ckey)")
+        where.append(
+            "EXISTS (SELECT 1 FROM catalogo.cuenta_planificacion cp_anc "
+            "WHERE cp_anc.codigo = :ckey "
+            "AND (c.path = cp_anc.path OR c.path LIKE cp_anc.path + '.%'))"
+        )
         params["ckey"] = ancestro
     where_sql = " AND ".join(where)
 
@@ -372,9 +413,9 @@ async def avance_lineas(
           pt.codigo AS planilla_codigo, pt.nombre AS planilla_nombre,
           c.codigo AS cuenta_codigo, c.descripcion AS cuenta_desc,
           l.modalidad, l.parametros, l.justificacion,
-          l.monto_solicitado::float AS monto,
+          CAST(l.monto_solicitado AS FLOAT) AS monto,
           l.created_at, l.updated_at,
-          uc.nombre || ' ' || uc.apellido AS creado_por
+          uc.nombre + ' ' + uc.apellido AS creado_por
         FROM planificacion.linea_solicitud l
         JOIN planificacion.solicitud s ON s.id = l.solicitud_id
         JOIN core.ciclo_presupuestario cp ON cp.id = s.ciclo_id
@@ -385,7 +426,8 @@ async def avance_lineas(
         WHERE {where_sql}
         ORDER BY l.created_at DESC
     """
-    rows = (await db.execute(text(sql), params)).mappings().all()
+    stmt = _bind_expanding_pextra(text(sql), params)
+    rows = (await db.execute(stmt, params)).mappings().all()
     return {
         "ciclo_anio": ciclo_anio,
         "item_codigo": item_codigo,

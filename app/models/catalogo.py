@@ -1,6 +1,28 @@
+"""Modelos del schema `catalogo` — datos maestros del sistema.
+
+Items (lo que se gasta) y Cuentas (en qué cuenta contable se imputa) son las
+dos jerarquías centrales. Cada una arma un árbol N-ario con código dot-notation
+(items: 02.05.01) o segmentado por punto (cuentas: 5.4.1.01), más una columna
+`path` con notación tipo ltree (n02.n05.n01) que en PG usaba el tipo nativo
+y en MSSQL emulamos con LIKE prefijo.
+
+Otros catálogos:
+  Gestor              dueño funcional del item.
+  GestorItem          asignación N a N gestor ↔ item.
+  RelacionItemCuenta  matriz de combinaciones VÁLIDAS item↔cuenta. Es el
+                      guard duro: si la combinación no está acá, el backend
+                      rechaza la línea con 400.
+  TipoMovimiento      tipos K2B con categoría (inicial/modificacion/...).
+  PlanPresupuestario  PRESUPDEGASTOS, PRESUPBUSO (Capital), etc.
+  PlanillaTemplate    metadatos de cada planilla cargable.
+  Formula/FormulaParametro  fórmulas paramétricas (vacíos por ahora).
+  Posicion/ParametroDestino otros (vacíos por ahora).
+  Tarifa*             tarifas de pasaje y hospedaje por ruta/ciudad/mes.
+"""
 from datetime import date, datetime
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -16,7 +38,6 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -75,8 +96,8 @@ class ItemPlanificacion(Base):
     estado: Mapped[str] = mapped_column(String(16), default="activo")
     vigente_desde: Mapped[date | None] = mapped_column(Date, nullable=True)
     vigente_hasta: Mapped[date | None] = mapped_column(Date, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"))
 
 
 class CuentaPlanificacion(Base):
@@ -180,7 +201,7 @@ class Formula(Base):
     vigencia_desde: Mapped[date | None] = mapped_column(Date, nullable=True)
     vigencia_hasta: Mapped[date | None] = mapped_column(Date, nullable=True)
     created_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("core.usuario.id"), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"))
 
 
 class FormulaParametro(Base):
@@ -214,7 +235,8 @@ class ParametroDestino(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     destino: Mapped[str] = mapped_column(String(8))
     tipo: Mapped[str] = mapped_column(
-        Enum("pasaje", "viatico", "hospedaje", "otros", name="dest_tipo", schema="catalogo")
+        Enum("pasaje", "viatico", "hospedaje", "perdiem", "otros",
+             name="dest_tipo", schema="catalogo")
     )
     monto: Mapped[float] = mapped_column(Numeric(18, 2))
     vigente_desde: Mapped[date] = mapped_column(Date)
@@ -229,14 +251,19 @@ class PlanillaTemplate(Base):
     codigo: Mapped[str] = mapped_column(String(64), unique=True)
     nombre: Mapped[str] = mapped_column(String(255))
     descripcion: Mapped[str | None] = mapped_column(Text, nullable=True)
-    scope_filter: Mapped[dict] = mapped_column(JSONB)
+    scope_filter: Mapped[dict] = mapped_column(JSON)
     modalidad_permitida: Mapped[str] = mapped_column(
         Enum("parametrizada", "directa", "ambas", name="planilla_modalidad", schema="catalogo")
     )
     formula_default_codigo: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    columnas_visibles: Mapped[list[dict]] = mapped_column(JSONB)
-    reglas_validacion: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    columnas_visibles: Mapped[list[dict]] = mapped_column(JSON)
+    reglas_validacion: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     orden: Mapped[int] = mapped_column(SmallInteger, default=0)
     vigente_desde: Mapped[date | None] = mapped_column(Date, nullable=True)
     vigente_hasta: Mapped[date | None] = mapped_column(Date, nullable=True)
     estado: Mapped[str] = mapped_column(String(16), default="activo")
+    # Si `solo_cross_vp` = True, la planilla solo puede cargarse por usuarios que
+    # la tengan en `core.usuario_planilla_extra` — la regla por defecto "estoy en
+    # mi propia VP, puedo todas las planillas" NO aplica. Usado para planillas
+    # institucionales con dueño único (ej. Gastos de Administración → mgarcia).
+    solo_cross_vp: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("0"))

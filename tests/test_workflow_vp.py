@@ -1,14 +1,3 @@
-"""Tests del workflow de aprobación con Vicepresidente intermedio.
-
-Cubren los caminos que TI/negocio verifican:
-  - Happy path: cargador → VP → Presidencia → aprobado
-  - VP observa → vuelve a etapa 0 → cargador resuelve obs → reenvía → VP aprueba
-  - Presidencia devuelve → vuelve a etapa 0 → cargador → VP de nuevo → Presidencia
-  - RBAC: jefe_unidad NO puede aprobar como VP; VP de otra VP no puede actuar
-  - PRE salta etapa VP (cargador → Presidencia directo)
-
-Los tests crean su PROPIA solicitud descartable para no contaminar la #13.
-"""
 import os
 
 import pytest
@@ -51,12 +40,17 @@ async def solicitud_descartable(client):
     async with SessionLocal() as db:
         # Limpieza preventiva por si quedó algo de una corrida anterior fallida.
         await db.execute(text("""
-            DELETE FROM planificacion.solicitud
-            WHERE ciclo_id IN (SELECT id FROM core.ciclo_presupuestario WHERE anio = 2099)
+            DELETE FROM planificacion.evento_solicitud WHERE solicitud_id IN (SELECT s.id FROM planificacion.solicitud s JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2099);
+            DELETE FROM planificacion.linea_solicitud WHERE solicitud_id IN (SELECT s.id FROM planificacion.solicitud s JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2099);
+            DELETE FROM planificacion.snapshot_linea WHERE snapshot_id IN (SELECT ss.id FROM planificacion.snapshot_solicitud ss JOIN planificacion.solicitud s ON s.id=ss.solicitud_id JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2099);
+            DELETE FROM planificacion.snapshot_solicitud WHERE solicitud_id IN (SELECT s.id FROM planificacion.solicitud s JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2099);
+            DELETE FROM planificacion.observacion WHERE solicitud_id IN (SELECT s.id FROM planificacion.solicitud s JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2099);
+            DELETE FROM planificacion.solicitud WHERE ciclo_id IN (SELECT id FROM core.ciclo_presupuestario WHERE anio=2099)
         """))
         await db.execute(text("DELETE FROM core.ciclo_presupuestario WHERE anio = 2099"))
         await db.execute(text("""
             INSERT INTO core.ciclo_presupuestario (anio, nombre, estado, created_by)
+            OUTPUT INSERTED.id
             VALUES (2099, 'Ciclo 2099 (test)', 'planificacion',
                    (SELECT id FROM core.usuario WHERE username='mmednik'))
         """))
@@ -66,9 +60,9 @@ async def solicitud_descartable(client):
         sid = (await db.execute(text("""
             INSERT INTO planificacion.solicitud
               (ciclo_id, vp_codigo, nombre, etapa_actual, estado_workflow, created_by)
+            OUTPUT INSERTED.id
             VALUES (:c, 'VPF', 'Test workflow VPF', 0, 'en_elaboracion',
                    (SELECT id FROM core.usuario WHERE username='mmednik'))
-            RETURNING id
         """), {"c": ciclo_id})).scalar()
         await db.commit()
 
@@ -76,6 +70,11 @@ async def solicitud_descartable(client):
 
     # Cleanup
     async with SessionLocal() as db:
+        await db.execute(text("DELETE FROM planificacion.evento_solicitud WHERE solicitud_id=:s"), {"s": sid})
+        await db.execute(text("DELETE FROM planificacion.snapshot_linea WHERE snapshot_id IN (SELECT id FROM planificacion.snapshot_solicitud WHERE solicitud_id=:s)"), {"s": sid})
+        await db.execute(text("DELETE FROM planificacion.snapshot_solicitud WHERE solicitud_id=:s"), {"s": sid})
+        await db.execute(text("DELETE FROM planificacion.observacion WHERE solicitud_id=:s"), {"s": sid})
+        await db.execute(text("DELETE FROM planificacion.linea_solicitud WHERE solicitud_id=:s"), {"s": sid})
         await db.execute(text("DELETE FROM planificacion.solicitud WHERE id=:s"), {"s": sid})
         await db.execute(text("DELETE FROM core.ciclo_presupuestario WHERE anio=2099"))
         await db.commit()

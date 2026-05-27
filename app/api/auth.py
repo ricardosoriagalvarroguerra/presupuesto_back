@@ -1,21 +1,31 @@
-"""Auth endpoints — login con username/email + bcrypt + MFA TOTP + emisión JWT.
+"""Login, cambio de password, MFA TOTP, emisión de JWT.
 
-El JWT es la identidad. El backend NUNCA confía en `usuario_id` recibido en
-payloads — siempre lo lee del token (Depends(get_current_user)).
+La identidad siempre se lee del token (JWT firmado). Los schemas Pydantic
+todavía aceptan un campo `usuario_id` por compatibilidad con clientes viejos,
+pero el backend lo ignora — la fuente es siempre `Depends(get_current_user)`.
 
 Flujos:
-  POST /auth/login                   → (a) ok                 → token full
-                                       (b) requiere cambio pw  → token scope='pwd_change' (solo /auth/cambiar-password)
-                                       (c) requiere MFA        → 401 "mfa_required"
-  POST /auth/login (con mfa_code)    → si user tiene MFA habilitado, valida y emite token full
-  POST /auth/cambiar-password        → requiere token; valida password actual + reglas mínimas; libera scope full
-  POST /auth/mfa/setup               → requiere token full + password actual; devuelve secret + URI para QR
-  POST /auth/mfa/enable              → requiere token full; confirma con código TOTP y activa
-  POST /auth/mfa/disable             → requiere token full + password actual; desactiva
+  POST /auth/login
+    ├─ user inexistente      → 401 (mismo texto que pw inválida — anti-enum)
+    ├─ pw inválida           → 401
+    ├─ requiere MFA          → 401 con detail.code='mfa_required'
+    ├─ requiere cambio pw    → 200 + token scope='pwd_change' (limitado)
+    └─ ok                    → 200 + token scope='full'
 
-Cada intento de login deja registro en auditoria.login_evento (best-effort:
-si la migración 029 no se aplicó, loguea WARNING y sigue — no rompe login).
+  POST /auth/cambiar-password
+    Acepta tokens 'full' (cambio voluntario) y 'pwd_change' (cambio obligado).
+    Exige password actual en ambos casos — protección contra hijack del token.
+
+  POST /auth/mfa/{setup,enable,disable}
+    Setup pide pw actual y devuelve secret + otpauth_uri.
+    Enable confirma con TOTP válido → activa MFA.
+    Disable pide pw + TOTP (anti-takeover por celular robado).
+
+Cada intento de login (exitoso o no) deja registro en `auditoria.login_evento`.
+Si la tabla no existe (setup incompleto), se loguea WARNING y el login sigue
+funcionando — un audit log caído no debería tirar el sistema.
 """
+import binascii
 import logging
 import re
 from typing import Any
@@ -25,7 +35,7 @@ import pyotp
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select, text
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -170,18 +180,24 @@ async def _registrar_login(
         )
         await db.commit()
     except ProgrammingError as e:
-        # Tabla no existe (migración 029 pendiente) — no romper el login.
+        # Tabla no existe (migración 029 pendiente) — no rompemos el login por eso.
         await db.rollback()
         logger.warning("auditoria.login_evento no disponible (correr alembic upgrade head): %s", e)
-    except Exception as e:  # noqa: BLE001
+    except SQLAlchemyError as e:
+        # Cualquier otro error de DB (FK rota, deadlock, conexión perdida).
+        # No romper login por una falla del audit log.
         await db.rollback()
         logger.warning("no se pudo registrar login_evento: %s", e)
 
 
 def _password_cumple_reglas(pwd: str) -> tuple[bool, str | None]:
-    """Reglas mínimas de TI: 10+ chars, al menos 1 mayúscula, 1 minúscula,
-    1 dígito, 1 símbolo. No exige diccionario — eso queda para una capa de
-    rotación posterior.
+    """Reglas mínimas: 10+ chars, mayúscula, minúscula, dígito, símbolo.
+
+    Devuelve (ok, mensaje_de_error). Si todo está bien, mensaje=None.
+
+    No chequeamos contra diccionario (passwords comunes tipo "Password123!")
+    — eso queda como mejora futura. La rotación obligatoria se maneja aparte
+    con el flag `requiere_cambio_password`.
     """
     if len(pwd) < 10:
         return False, "La contraseña debe tener al menos 10 caracteres."
@@ -197,10 +213,15 @@ def _password_cumple_reglas(pwd: str) -> tuple[bool, str | None]:
 
 
 def _hash_password(pwd: str) -> str:
+    # bcrypt con 10 rounds: balance entre seguridad y latencia. Cada round
+    # duplica el costo (12 sería ~4x más lento por login). Si se sube el cost
+    # factor, cambiar acá y regenerar hashes en el próximo cambio obligatorio.
     return bcrypt.hashpw(pwd.encode("utf-8"), bcrypt.gensalt(10)).decode("utf-8")
 
 
 def _verify_password(pwd: str, hashed: str) -> bool:
+    # Hashes corruptos, vacíos o no-bcrypt → False. No levantamos excepción
+    # porque el caller termina cayendo por la rama "credencial inválida" igual.
     try:
         return bcrypt.checkpw(pwd.encode("utf-8"), hashed.encode("utf-8"))
     except (ValueError, TypeError):
@@ -208,15 +229,29 @@ def _verify_password(pwd: str, hashed: str) -> bool:
 
 
 def _verify_totp(secret: str | None, codigo: str | None) -> bool:
+    """Valida un código TOTP de 6 dígitos. valid_window=1 → tolera ±30s.
+
+    Si secret o código son falsy → False (defensa en profundidad; los callers
+    ya chequean antes).
+    """
     if not secret or not codigo:
         return False
     try:
         return pyotp.TOTP(secret).verify(codigo.strip(), valid_window=1)
-    except Exception:  # noqa: BLE001
+    except (ValueError, TypeError, binascii.Error):
+        # pyotp tira ValueError/binascii si el secret base32 está corrupto.
+        # Devolvemos False
+        # para que el flujo termine en "código inválido" en vez de 500.
         return False
 
 
 def _token_full(user: Usuario, roles: list[str]) -> str:
+    """JWT scope='full' — el token que se usa para el día a día.
+
+    Claims útiles para el frontend (evita un /me extra al login):
+      vp, ver_todo, roles, scope
+    Expira en 8 horas por default (configurable vía JWT_ACCESS_TOKEN_EXPIRE_MINUTES).
+    """
     return create_access_token(
         usuario_id=user.id,
         email=user.email,
@@ -230,7 +265,13 @@ def _token_full(user: Usuario, roles: list[str]) -> str:
 
 
 def _token_pwd_change(user: Usuario) -> str:
-    """Token de scope reducido — solo /auth/cambiar-password lo acepta."""
+    """JWT scope='pwd_change' — limitado, expira en 15 min.
+
+    Se emite cuando el user tiene `requiere_cambio_password=true`. Con este
+    token NO se puede operar nada del sistema, solo POST a /auth/cambiar-password.
+    Cuando el cambio se completa, ese endpoint emite un token full nuevo.
+    El frontend detecta el scope y abre el wizard de cambio obligatorio.
+    """
     return create_access_token(
         usuario_id=user.id,
         email=user.email,
@@ -312,11 +353,11 @@ async def login(
     # actualizar ultimo_login (best-effort)
     try:
         await db.execute(
-            text("UPDATE core.usuario SET ultimo_login = now() WHERE id = :u"),
+            text("UPDATE core.usuario SET ultimo_login = SYSDATETIMEOFFSET() WHERE id = :u"),
             {"u": user.id},
         )
         await db.commit()
-    except Exception as e:  # noqa: BLE001
+    except SQLAlchemyError as e:
         await db.rollback()
         logger.warning("no se pudo actualizar ultimo_login: %s", e)
     logger.info("login ok user_id=%s email=%s mfa=%s", user.id, user.email, mfa_usado)
@@ -373,8 +414,8 @@ async def cambiar_password(
     await db.execute(
         text("""UPDATE core.usuario
                 SET password_hash = :h,
-                    requiere_cambio_password = false,
-                    updated_at = now()
+                    requiere_cambio_password = 0,
+                    updated_at = SYSDATETIMEOFFSET()
                 WHERE id = :u"""),
         {"h": new_hash, "u": user.id},
     )
@@ -408,7 +449,7 @@ async def mfa_setup(
     secret = pyotp.random_base32()
     await db.execute(
         text("""UPDATE core.usuario
-                SET mfa_secret = :s, mfa_habilitado = false, updated_at = now()
+                SET mfa_secret = :s, mfa_habilitado = 0, updated_at = SYSDATETIMEOFFSET()
                 WHERE id = :u"""),
         {"s": secret, "u": user.id},
     )
@@ -432,7 +473,7 @@ async def mfa_enable(
     if not _verify_totp(user.mfa_secret, payload.codigo):
         raise HTTPException(400, "Código MFA inválido. Verificá que tu reloj esté sincronizado.")
     await db.execute(
-        text("UPDATE core.usuario SET mfa_habilitado = true, updated_at = now() WHERE id = :u"),
+        text("UPDATE core.usuario SET mfa_habilitado = 1, updated_at = SYSDATETIMEOFFSET() WHERE id = :u"),
         {"u": user.id},
     )
     await db.commit()
@@ -458,7 +499,7 @@ async def mfa_disable(
         raise HTTPException(400, "Código MFA inválido.")
     await db.execute(
         text("""UPDATE core.usuario
-                SET mfa_habilitado = false, mfa_secret = NULL, updated_at = now()
+                SET mfa_habilitado = 0, mfa_secret = NULL, updated_at = SYSDATETIMEOFFSET()
                 WHERE id = :u"""),
         {"u": user.id},
     )

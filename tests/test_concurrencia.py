@@ -1,18 +1,3 @@
-"""Tests de concurrencia / TOCTOU del workflow (cierre de gap multi-usuario).
-
-Antes de los locks `FOR UPDATE`, el guard de estado en agregar_linea/modificar_linea/
-eliminar_linea se hacía SIN bloquear la fila de la solicitud, así que un POST
-podía colarse después de que otro usuario ya había ejecutado una transición.
-Acá probamos los dos escenarios:
-
-  - Solicitud ya transicionada → POST /lineas tira 409 (no inserta huérfana).
-  - Doble transición secuencial sobre la misma solicitud: la segunda tira 409
-    porque el estado destino ya no es válido como origen.
-
-Probar la concurrencia REAL (dos requests en paralelo a la misma fila) requiere
-otro engine/conexión; estos tests verifican el contrato (estado → guard 409) que
-es lo que el lock garantiza.
-"""
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
@@ -35,12 +20,17 @@ async def sid_listo_para_enviar():
     from app.db import SessionLocal
     async with SessionLocal() as db:
         await db.execute(text("""
-            DELETE FROM planificacion.solicitud
-            WHERE ciclo_id IN (SELECT id FROM core.ciclo_presupuestario WHERE anio=2097)
+            DELETE FROM planificacion.evento_solicitud WHERE solicitud_id IN (SELECT s.id FROM planificacion.solicitud s JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2097);
+            DELETE FROM planificacion.linea_solicitud WHERE solicitud_id IN (SELECT s.id FROM planificacion.solicitud s JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2097);
+            DELETE FROM planificacion.snapshot_linea WHERE snapshot_id IN (SELECT ss.id FROM planificacion.snapshot_solicitud ss JOIN planificacion.solicitud s ON s.id=ss.solicitud_id JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2097);
+            DELETE FROM planificacion.snapshot_solicitud WHERE solicitud_id IN (SELECT s.id FROM planificacion.solicitud s JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2097);
+            DELETE FROM planificacion.observacion WHERE solicitud_id IN (SELECT s.id FROM planificacion.solicitud s JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2097);
+            DELETE FROM planificacion.solicitud WHERE ciclo_id IN (SELECT id FROM core.ciclo_presupuestario WHERE anio=2097)
         """))
         await db.execute(text("DELETE FROM core.ciclo_presupuestario WHERE anio=2097"))
         await db.execute(text("""
             INSERT INTO core.ciclo_presupuestario (anio, nombre, estado, created_by)
+            OUTPUT INSERTED.id
             VALUES (2097, 'Ciclo 2097 (test)', 'planificacion',
                    (SELECT id FROM core.usuario WHERE username='mmednik'))
         """))
@@ -50,15 +40,20 @@ async def sid_listo_para_enviar():
         sid = (await db.execute(text("""
             INSERT INTO planificacion.solicitud
               (ciclo_id, vp_codigo, nombre, etapa_actual, estado_workflow, created_by)
+            OUTPUT INSERTED.id
             VALUES (:c, 'VPF', 'Test concurrencia', 0, 'en_elaboracion',
                    (SELECT id FROM core.usuario WHERE username='mmednik'))
-            RETURNING id
         """), {"c": cid})).scalar()
         await db.commit()
 
     yield sid
 
     async with SessionLocal() as db:
+        await db.execute(text("DELETE FROM planificacion.evento_solicitud WHERE solicitud_id=:s"), {"s": sid})
+        await db.execute(text("DELETE FROM planificacion.snapshot_linea WHERE snapshot_id IN (SELECT id FROM planificacion.snapshot_solicitud WHERE solicitud_id=:s)"), {"s": sid})
+        await db.execute(text("DELETE FROM planificacion.snapshot_solicitud WHERE solicitud_id=:s"), {"s": sid})
+        await db.execute(text("DELETE FROM planificacion.observacion WHERE solicitud_id=:s"), {"s": sid})
+        await db.execute(text("DELETE FROM planificacion.linea_solicitud WHERE solicitud_id=:s"), {"s": sid})
         await db.execute(text("DELETE FROM planificacion.solicitud WHERE id=:s"), {"s": sid})
         await db.execute(text("DELETE FROM core.ciclo_presupuestario WHERE anio=2097"))
         await db.commit()
@@ -123,14 +118,14 @@ async def test_modificar_linea_falla_si_solicitud_paso_a_revision(client, sid_li
             INSERT INTO planificacion.linea_solicitud
               (solicitud_id, planilla_template_id, item_id, cuenta_id, plan_id,
                modalidad, monto_solicitado, created_by)
+            OUTPUT INSERTED.id
             VALUES (:s,
-                    (SELECT id FROM catalogo.planilla_template LIMIT 1),
-                    (SELECT id FROM catalogo.item_planificacion LIMIT 1),
-                    (SELECT id FROM catalogo.cuenta_planificacion LIMIT 1),
-                    (SELECT id FROM catalogo.plan_presupuestario LIMIT 1),
+                    (SELECT TOP 1 id FROM catalogo.planilla_template),
+                    (SELECT TOP 1 id FROM catalogo.item_planificacion),
+                    (SELECT TOP 1 id FROM catalogo.cuenta_planificacion),
+                    (SELECT TOP 1 id FROM catalogo.plan_presupuestario),
                     'directa', 500,
                     (SELECT id FROM core.usuario WHERE username='mmednik'))
-            RETURNING id
         """), {"s": sid})).scalar()
         await db.commit()
 

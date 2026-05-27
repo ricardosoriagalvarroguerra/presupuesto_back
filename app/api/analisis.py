@@ -1,22 +1,48 @@
-"""Endpoints del módulo Análisis: cuadros DPP automatizables.
+"""Cuadros DPP — el módulo Análisis.
 
-Los cuadros se calculan en vivo sobre `ejecucion.movimiento`. Las categorías son:
-  - APROBADO/VIGENTE = movimientos con categoria IN ('inicial', 'modificacion')
-  - EJECUTADO       = movimientos con categoria IN ('compromiso','devengado','pagado')
-                      menos categoria 'reverso'
+9 cuadros oficiales que se generan en vivo desde la BDR:
+  Cuadro 4 (Gastos Admin), 6 (Gobernanza), 8 (Misiones), 9 (Consultores),
+  10 (Personal), 12 (Operativos), 14/15 (TI), 16 (Ejecución).
+
+Datos: salen de `ejecucion.movimiento` vía la vista `ejecucion.movimiento_dedup`.
+Las planillas de carga solo afectan la entrada (planificación); para
+reportería trabajamos sobre los movimientos K2B.
+
+Semántica de las categorías de tipo de movimiento (catalogo.tipo_movimiento):
+  - inicial         → presupuesto liberado (PRESUPLIBERACIONPLAN)
+  - modificacion    → ajuste de crédito inicial (AJUSTECREDITOINICIAL)
+  - compromiso      → reserva contra ejecución
+  - devengado       → gasto reconocido
+  - pagado          → desembolsado
+  - reverso         → anulación (se resta del ejecutado)
+  - especial        → casos puntuales no-presupuestales
+
+Fórmulas universales:
+  APROBADO  = SUM(monto_vigente) WHERE categoria='inicial'
+  VIGENTE   = APROBADO + SUM(monto_vigente) WHERE categoria='modificacion'
+  EJECUTADO = SUM(monto_ejecutado) WHERE categoria NOT IN ('inicial','modificacion')
+              (la categoria 'reverso' ya viene con signo negativo en m.signo)
+
+Dedup: `ejecucion.movimiento_dedup` filtra al snapshot más reciente por año.
+El mismo movimiento K2B puede aparecer en varios cortes (ej. `corte_2026_03`
+y `corte_2026_05`); sin dedup los SUM se duplicarían.
 """
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.security import get_current_user
 
-# Dashboards institucionales: visibles para cualquier usuario autenticado, pero
-# no para anónimos. Auth a nivel router (cuadros DPP son consolidados, no se
-# filtran por VP en este módulo).
+# Dashboards institucionales — cualquier usuario autenticado puede verlos.
+# NO se filtra por VP: los cuadros DPP son consolidados (toda la organización),
+# no se desglosan por scope del usuario. Un cargador de VPE que entre al
+# cuadro 10 (Personal) ve datos de toda la institución, no solo de su VP.
+# Si en algún momento hace falta filtrar por rol, el guard va acá a nivel
+# router.
 router = APIRouter(
     prefix="/analisis",
     tags=["analisis"],
@@ -24,7 +50,9 @@ router = APIRouter(
 )
 
 
-# Filtro común: cuáles tipos de movimiento cuentan como "aprobado vigente" y como "ejecutado"
+# Macros SQL reusables — strings con CASE que se inyectan con f-strings para
+# no repetir el mismo CASE 30 veces. Son constantes del código (no llegan
+# datos del cliente) así que el uso de f-string no abre inyección SQL.
 SQL_APROBADO = """
   COALESCE(SUM(CASE WHEN tm.categoria = 'inicial' THEN m.monto_vigente ELSE 0 END), 0)
 """
@@ -32,7 +60,8 @@ SQL_EJECUTADO = """
   COALESCE(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END), 0)
 """
 
-# Macros SQL: alias y orden canónico de Vicepresidencia (DPP usa código corto y orden fijo)
+# Orden canónico de las VPs en los cuadros: GOB, PRE, VPE, VPD, VPO, VPF.
+# Este orden es el que esperan los informes y los frontends que arman tablas.
 VP_ALIAS_SQL = """CASE m.vp_codigo
   WHEN 'GOBERNANZA INSTITUCIONAL' THEN 'GOB'
   WHEN 'PRESIDENCIA EJECUTIVA' THEN 'PRE'
@@ -51,32 +80,59 @@ VP_ORDER_SQL = """CASE m.vp_codigo
   WHEN 'VICEPRESIDENCIA DE FINANZAS' THEN 6
 END"""
 
+# Filtra movimientos que tienen VP "asignable" — los marcados TRANSVERSAL son
+# gastos institucionales que no pertenecen a ninguna VP en particular
+# (Capital, Fondo de Terminación de Personal, etc.). Los cuadros por VP los
+# excluyen para no mostrar un bloque adicional "TRANSVERSAL" que confunde
+# el lectura.
 VP_FILTRO_SQL = "m.vp_codigo IS NOT NULL AND m.vp_codigo != 'TRANSVERSAL'"
 
-# JOIN al último snapshot disponible por año — deduplica cuando el mismo movimiento
-# K2B aparece en varios cortes (ej. el aprobado 2026 está en corte_2026_03 Y corte_2026_05).
-# Sin este JOIN los SUMs duplican.
+# Originalmente este string traía un JOIN para deduplicar al último snapshot
+# por año. La dedup ahora vive en la vista `ejecucion.movimiento_dedup`, así
+# que quedó vacío. Lo dejo como placeholder por si vuelve a hacer falta un
+# JOIN ad-hoc desde acá.
 JOIN_ULTIMO_SNAPSHOT = """"""
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Definición de los 9 cuadros DPP.
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Cada entrada es una "ficha" del cuadro: título, descripción, columnas,
+# fuente, y SQL completa. El endpoint genérico /analisis/cuadros/{codigo}
+# ejecuta el SQL y devuelve un dict simple (cabecera + filas) que el
+# frontend pinta como tabla.
+#
+# La SQL de cada cuadro suele tener la misma estructura:
+#   1. CTE `base` con un SELECT plano filtrando movimientos del año + plan.
+#   2. CTE por año (2025, 2026) agregando por VP / cuenta / item.
+#   3. CTE `combinado` con UNION ALL de filas por VP + totales + variaciones.
+#   4. SELECT final ordenando por la columna `_order`.
+#
+# La estructura está intencionalmente duplicada entre cuadros. Cada cuadro
+# tiene su propia variación de columnas y agregados, y compartir CTEs hacía
+# que un cambio puntual en un cuadro arrastrara cambios en otros.
 CUADROS: dict[str, dict[str, Any]] = {
     "cuadro-4-presupuesto-gastos-admin": {
         "titulo": "Cuadro 4 — Presupuesto de Gastos Administrativos 2026",
         "descripcion": "VP × Reuniones / Misiones / Servicios Profesionales / Gastos en Personal / Gastos Operativos + Total (aprobado 2026), con totales institucionales 2025/2026 y variación.",
         "fuente": "planificacion",
         "columnas": ["vp", "reuniones", "misiones", "servicios_prof", "gastos_personal", "gastos_operativos", "total"],
+        # Cuadro 4: matriz VP × categoría de gasto, con totales y variación 2026 vs 2025.
+        # Las 5 categorías salen del path de cuenta (5.5 reuniones, 5.4 misiones, etc.) —
+        # antes con operador ltree de PG; en MSSQL emulamos con LIKE prefijo.
         "sql": f"""
             WITH base AS (
               SELECT
                 {VP_ALIAS_SQL} AS vp,
                 {VP_ORDER_SQL} AS vp_orden,
-                EXTRACT(YEAR FROM m.fecha_movimiento)::int AS anio,
+                YEAR(m.fecha_movimiento) AS anio,
                 CASE
-                  WHEN c.path <@ CAST('n5.n5' AS ltree) THEN 'reuniones'
-                  WHEN c.path <@ CAST('n5.n4' AS ltree) THEN 'misiones'
-                  WHEN c.path <@ CAST('n5.n3' AS ltree) THEN 'servicios_prof'
-                  WHEN c.path <@ CAST('n5.n2' AS ltree) THEN 'gastos_personal'
-                  WHEN c.path <@ CAST('n5.n6' AS ltree) THEN 'gastos_operativos'
+                  WHEN (c.path = 'n5.n5' OR c.path LIKE 'n5.n5.%') THEN 'reuniones'
+                  WHEN (c.path = 'n5.n4' OR c.path LIKE 'n5.n4.%') THEN 'misiones'
+                  WHEN (c.path = 'n5.n3' OR c.path LIKE 'n5.n3.%') THEN 'servicios_prof'
+                  WHEN (c.path = 'n5.n2' OR c.path LIKE 'n5.n2.%') THEN 'gastos_personal'
+                  WHEN (c.path = 'n5.n6' OR c.path LIKE 'n5.n6.%') THEN 'gastos_operativos'
                   ELSE 'otros'
                 END AS cat,
                 CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END AS monto
@@ -84,29 +140,29 @@ CUADROS: dict[str, dict[str, Any]] = {
               JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
               JOIN catalogo.cuenta_planificacion c ON c.id = m.cuenta_id
               JOIN catalogo.plan_presupuestario p ON p.id = m.plan_id
-              WHERE EXTRACT(YEAR FROM m.fecha_movimiento) IN (2025, 2026)
+              WHERE YEAR(m.fecha_movimiento) IN (2025, 2026)
                 AND p.codigo = 'PRESUPDEGASTOS'
                 AND {VP_FILTRO_SQL}
             ),
             por_vp_2026 AS (
               SELECT
                 vp, vp_orden,
-                SUM(monto) FILTER (WHERE cat='reuniones'         AND anio=2026) AS reuniones,
-                SUM(monto) FILTER (WHERE cat='misiones'          AND anio=2026) AS misiones,
-                SUM(monto) FILTER (WHERE cat='servicios_prof'    AND anio=2026) AS servicios_prof,
-                SUM(monto) FILTER (WHERE cat='gastos_personal'   AND anio=2026) AS gastos_personal,
-                SUM(monto) FILTER (WHERE cat='gastos_operativos' AND anio=2026) AS gastos_operativos,
-                SUM(monto) FILTER (WHERE anio=2026) AS total
+                SUM(CASE WHEN cat='reuniones'         AND anio=2026 THEN monto ELSE 0 END) AS reuniones,
+                SUM(CASE WHEN cat='misiones'          AND anio=2026 THEN monto ELSE 0 END) AS misiones,
+                SUM(CASE WHEN cat='servicios_prof'    AND anio=2026 THEN monto ELSE 0 END) AS servicios_prof,
+                SUM(CASE WHEN cat='gastos_personal'   AND anio=2026 THEN monto ELSE 0 END) AS gastos_personal,
+                SUM(CASE WHEN cat='gastos_operativos' AND anio=2026 THEN monto ELSE 0 END) AS gastos_operativos,
+                SUM(CASE WHEN anio=2026 THEN monto ELSE 0 END) AS total
               FROM base GROUP BY vp, vp_orden
             ),
             totales AS (
               SELECT
                 anio,
-                SUM(monto) FILTER (WHERE cat='reuniones')         AS reuniones,
-                SUM(monto) FILTER (WHERE cat='misiones')          AS misiones,
-                SUM(monto) FILTER (WHERE cat='servicios_prof')    AS servicios_prof,
-                SUM(monto) FILTER (WHERE cat='gastos_personal')   AS gastos_personal,
-                SUM(monto) FILTER (WHERE cat='gastos_operativos') AS gastos_operativos,
+                SUM(CASE WHEN cat='reuniones' THEN monto ELSE 0 END)         AS reuniones,
+                SUM(CASE WHEN cat='misiones' THEN monto ELSE 0 END)          AS misiones,
+                SUM(CASE WHEN cat='servicios_prof' THEN monto ELSE 0 END)    AS servicios_prof,
+                SUM(CASE WHEN cat='gastos_personal' THEN monto ELSE 0 END)   AS gastos_personal,
+                SUM(CASE WHEN cat='gastos_operativos' THEN monto ELSE 0 END) AS gastos_operativos,
                 SUM(monto) AS total
               FROM base GROUP BY anio
             ),
@@ -145,12 +201,12 @@ CUADROS: dict[str, dict[str, Any]] = {
               FROM t26 CROSS JOIN t25
             )
             SELECT vp,
-              ROUND(reuniones::numeric,         CASE WHEN vp_orden=10 THEN 1 ELSE 0 END) AS reuniones,
-              ROUND(misiones::numeric,          CASE WHEN vp_orden=10 THEN 1 ELSE 0 END) AS misiones,
-              ROUND(servicios_prof::numeric,    CASE WHEN vp_orden=10 THEN 1 ELSE 0 END) AS servicios_prof,
-              ROUND(gastos_personal::numeric,   CASE WHEN vp_orden=10 THEN 1 ELSE 0 END) AS gastos_personal,
-              ROUND(gastos_operativos::numeric, CASE WHEN vp_orden=10 THEN 1 ELSE 0 END) AS gastos_operativos,
-              ROUND(total::numeric,             CASE WHEN vp_orden=10 THEN 1 ELSE 0 END) AS total
+              ROUND(reuniones,         CASE WHEN vp_orden=10 THEN 1 ELSE 0 END) AS reuniones,
+              ROUND(misiones,          CASE WHEN vp_orden=10 THEN 1 ELSE 0 END) AS misiones,
+              ROUND(servicios_prof,    CASE WHEN vp_orden=10 THEN 1 ELSE 0 END) AS servicios_prof,
+              ROUND(gastos_personal,   CASE WHEN vp_orden=10 THEN 1 ELSE 0 END) AS gastos_personal,
+              ROUND(gastos_operativos, CASE WHEN vp_orden=10 THEN 1 ELSE 0 END) AS gastos_operativos,
+              ROUND(total,             CASE WHEN vp_orden=10 THEN 1 ELSE 0 END) AS total
             FROM combinado
             ORDER BY vp_orden
         """,
@@ -163,15 +219,15 @@ CUADROS: dict[str, dict[str, Any]] = {
         "sql": """
             SELECT
               COALESCE(m.area, '(sin área)') AS area,
-              ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END)::numeric, 0) AS monto_aprobado
+              ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END), 0) AS monto_aprobado
             FROM ejecucion.movimiento_dedup m
             JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
             WHERE m.vp_codigo = 'GOBERNANZA INSTITUCIONAL'
-              AND EXTRACT(YEAR FROM m.fecha_movimiento) = 2026
+              AND YEAR(m.fecha_movimiento) = 2026
               AND m.area IS NOT NULL AND m.area NOT IN ('', 'NaN', 'nan')
             GROUP BY m.area
             HAVING SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END) > 0
-            ORDER BY monto_aprobado DESC NULLS LAST
+            ORDER BY monto_aprobado DESC
         """,
     },
     "cuadro-8-misiones-comparativo": {
@@ -184,38 +240,38 @@ CUADROS: dict[str, dict[str, Any]] = {
               SELECT
                 {VP_ALIAS_SQL} AS vp,
                 {VP_ORDER_SQL} AS vp_orden,
-                EXTRACT(YEAR FROM m.fecha_movimiento)::int AS anio,
+                YEAR(m.fecha_movimiento) AS anio,
                 c.codigo AS ccod,
                 CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END AS monto
               FROM ejecucion.movimiento_dedup m
               JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
               JOIN catalogo.cuenta_planificacion c ON c.id = m.cuenta_id
               JOIN catalogo.plan_presupuestario p ON p.id = m.plan_id
-              WHERE c.path <@ CAST('n5.n4.n1' AS ltree)
+              WHERE (c.path = 'n5.n4.n1' OR c.path LIKE 'n5.n4.n1.%')
                 AND p.codigo = 'PRESUPDEGASTOS'
                 AND {VP_FILTRO_SQL}
-                AND EXTRACT(YEAR FROM m.fecha_movimiento) IN (2025, 2026)
+                AND YEAR(m.fecha_movimiento) IN (2025, 2026)
             ),
             agg AS (
               SELECT vp, vp_orden,
-                SUM(monto) FILTER (WHERE anio=2026 AND ccod='5.4.1.01') AS pasajes,
-                SUM(monto) FILTER (WHERE anio=2026 AND ccod='5.4.1.03') AS hospedaje,
-                SUM(monto) FILTER (WHERE anio=2026 AND ccod='5.4.1.02') AS viaticos,
-                SUM(monto) FILTER (WHERE anio=2026 AND ccod NOT IN ('5.4.1.01','5.4.1.02','5.4.1.03')) AS otros,
-                SUM(monto) FILTER (WHERE anio=2026) AS total_2026,
-                SUM(monto) FILTER (WHERE anio=2025) AS total_2025
+                SUM(CASE WHEN anio=2026 AND ccod='5.4.1.01' THEN monto ELSE 0 END) AS pasajes,
+                SUM(CASE WHEN anio=2026 AND ccod='5.4.1.03' THEN monto ELSE 0 END) AS hospedaje,
+                SUM(CASE WHEN anio=2026 AND ccod='5.4.1.02' THEN monto ELSE 0 END) AS viaticos,
+                SUM(CASE WHEN anio=2026 AND ccod NOT IN ('5.4.1.01','5.4.1.02','5.4.1.03') THEN monto ELSE 0 END) AS otros,
+                SUM(CASE WHEN anio=2026 THEN monto ELSE 0 END) AS total_2026,
+                SUM(CASE WHEN anio=2025 THEN monto ELSE 0 END) AS total_2025
               FROM base GROUP BY vp, vp_orden
             )
             SELECT
               vp,
-              ROUND(pasajes::numeric, 0) AS pasajes,
-              ROUND(hospedaje::numeric, 0) AS hospedaje,
-              ROUND(viaticos::numeric, 0) AS viaticos,
-              ROUND(otros::numeric, 0) AS otros,
-              ROUND(total_2026::numeric, 0) AS total_2026,
-              ROUND(total_2025::numeric, 0) AS total_2025,
-              ROUND((total_2026 - total_2025)::numeric, 0) AS variacion,
-              ROUND((100.0 * (total_2026 - total_2025) / NULLIF(total_2025, 0))::numeric, 1) AS variacion_pct
+              ROUND(pasajes, 0) AS pasajes,
+              ROUND(hospedaje, 0) AS hospedaje,
+              ROUND(viaticos, 0) AS viaticos,
+              ROUND(otros, 0) AS otros,
+              ROUND(total_2026, 0) AS total_2026,
+              ROUND(total_2025, 0) AS total_2025,
+              ROUND((total_2026 - total_2025), 0) AS variacion,
+              ROUND((100.0 * (total_2026 - total_2025) / NULLIF(total_2025, 0)), 1) AS variacion_pct
             FROM agg
             ORDER BY vp_orden
         """,
@@ -230,29 +286,29 @@ CUADROS: dict[str, dict[str, Any]] = {
               SELECT
                 {VP_ALIAS_SQL} AS vp,
                 {VP_ORDER_SQL} AS vp_orden,
-                EXTRACT(YEAR FROM m.fecha_movimiento)::int AS anio,
+                YEAR(m.fecha_movimiento) AS anio,
                 CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END AS monto
               FROM ejecucion.movimiento_dedup m
               JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
               JOIN catalogo.cuenta_planificacion c ON c.id = m.cuenta_id
               JOIN catalogo.plan_presupuestario p ON p.id = m.plan_id
-              WHERE c.path <@ CAST('n5.n3' AS ltree)
+              WHERE (c.path = 'n5.n3' OR c.path LIKE 'n5.n3.%')
                 AND p.codigo = 'PRESUPDEGASTOS'
                 AND {VP_FILTRO_SQL}
-                AND EXTRACT(YEAR FROM m.fecha_movimiento) IN (2025, 2026)
+                AND YEAR(m.fecha_movimiento) IN (2025, 2026)
             ),
             agg AS (
               SELECT vp, vp_orden,
-                SUM(monto) FILTER (WHERE anio=2025) AS m25,
-                SUM(monto) FILTER (WHERE anio=2026) AS m26
+                SUM(CASE WHEN anio=2025 THEN monto ELSE 0 END) AS m25,
+                SUM(CASE WHEN anio=2026 THEN monto ELSE 0 END) AS m26
               FROM base GROUP BY vp, vp_orden
             )
             SELECT
               vp,
-              ROUND(m25::numeric, 0) AS monto_2025,
-              ROUND(m26::numeric, 0) AS monto_2026,
-              ROUND((m26 - m25)::numeric, 0) AS variacion,
-              ROUND((100.0 * (m26 - m25) / NULLIF(m25, 0))::numeric, 1) AS variacion_pct
+              ROUND(m25, 0) AS monto_2025,
+              ROUND(m26, 0) AS monto_2026,
+              ROUND((m26 - m25), 0) AS variacion,
+              ROUND((100.0 * (m26 - m25) / NULLIF(m25, 0)), 1) AS variacion_pct
             FROM agg
             ORDER BY vp_orden
         """,
@@ -267,36 +323,36 @@ CUADROS: dict[str, dict[str, Any]] = {
               SELECT
                 {VP_ALIAS_SQL} AS vp,
                 {VP_ORDER_SQL} AS vp_orden,
-                EXTRACT(YEAR FROM m.fecha_movimiento)::int AS anio,
+                YEAR(m.fecha_movimiento) AS anio,
                 c.codigo AS ccod,
                 CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END AS monto
               FROM ejecucion.movimiento_dedup m
               JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
               JOIN catalogo.cuenta_planificacion c ON c.id = m.cuenta_id
               JOIN catalogo.plan_presupuestario p ON p.id = m.plan_id
-              WHERE c.path <@ CAST('n5.n2' AS ltree)
+              WHERE (c.path = 'n5.n2' OR c.path LIKE 'n5.n2.%')
                 AND p.codigo = 'PRESUPDEGASTOS'
                 AND {VP_FILTRO_SQL}
-                AND EXTRACT(YEAR FROM m.fecha_movimiento) IN (2025, 2026)
+                AND YEAR(m.fecha_movimiento) IN (2025, 2026)
             ),
             agg AS (
               SELECT vp, vp_orden,
-                SUM(monto) FILTER (WHERE anio=2025 AND ccod='5.2.1.01') AS sal25,
-                SUM(monto) FILTER (WHERE anio=2025 AND ccod='5.2.1.02') AS ben25,
-                SUM(monto) FILTER (WHERE anio=2026 AND ccod='5.2.1.01') AS sal26,
-                SUM(monto) FILTER (WHERE anio=2026 AND ccod='5.2.1.02') AS ben26
+                SUM(CASE WHEN anio=2025 AND ccod='5.2.1.01' THEN monto ELSE 0 END) AS sal25,
+                SUM(CASE WHEN anio=2025 AND ccod='5.2.1.02' THEN monto ELSE 0 END) AS ben25,
+                SUM(CASE WHEN anio=2026 AND ccod='5.2.1.01' THEN monto ELSE 0 END) AS sal26,
+                SUM(CASE WHEN anio=2026 AND ccod='5.2.1.02' THEN monto ELSE 0 END) AS ben26
               FROM base GROUP BY vp, vp_orden
             )
             SELECT
               vp,
-              ROUND(sal25::numeric, 0) AS salarios_2025,
-              ROUND(ben25::numeric, 0) AS beneficios_2025,
-              ROUND(sal26::numeric, 0) AS salarios_2026,
-              ROUND(ben26::numeric, 0) AS beneficios_2026,
-              ROUND((sal26 + ben26)::numeric, 0) AS total_2026,
-              ROUND((sal25 + ben25)::numeric, 0) AS total_2025,
-              ROUND(((sal26 + ben26) - (sal25 + ben25))::numeric, 0) AS variacion,
-              ROUND((100.0 * ((sal26 + ben26) - (sal25 + ben25)) / NULLIF(sal25 + ben25, 0))::numeric, 1) AS variacion_pct
+              ROUND(sal25, 0) AS salarios_2025,
+              ROUND(ben25, 0) AS beneficios_2025,
+              ROUND(sal26, 0) AS salarios_2026,
+              ROUND(ben26, 0) AS beneficios_2026,
+              ROUND((sal26 + ben26), 0) AS total_2026,
+              ROUND((sal25 + ben25), 0) AS total_2025,
+              ROUND(((sal26 + ben26) - (sal25 + ben25)), 0) AS variacion,
+              ROUND((100.0 * ((sal26 + ben26) - (sal25 + ben25)) / NULLIF(sal25 + ben25, 0)), 1) AS variacion_pct
             FROM agg
             ORDER BY vp_orden
         """,
@@ -310,31 +366,31 @@ CUADROS: dict[str, dict[str, Any]] = {
             WITH base AS (
               SELECT
                 c.codigo AS ccod,
-                EXTRACT(YEAR FROM m.fecha_movimiento)::int AS anio,
+                YEAR(m.fecha_movimiento) AS anio,
                 CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END AS monto
               FROM ejecucion.movimiento_dedup m
               JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
               JOIN catalogo.cuenta_planificacion c ON c.id = m.cuenta_id
               JOIN catalogo.plan_presupuestario p ON p.id = m.plan_id
-              WHERE c.path <@ CAST('n5.n6' AS ltree)
+              WHERE (c.path = 'n5.n6' OR c.path LIKE 'n5.n6.%')
                 AND p.codigo = 'PRESUPDEGASTOS'
-                AND EXTRACT(YEAR FROM m.fecha_movimiento) IN (2025, 2026)
+                AND YEAR(m.fecha_movimiento) IN (2025, 2026)
             ),
             m_x_cuenta AS (
               SELECT ccod,
-                SUM(monto) FILTER (WHERE anio=2025) AS m25,
-                SUM(monto) FILTER (WHERE anio=2026) AS m26
+                SUM(CASE WHEN anio=2025 THEN monto ELSE 0 END) AS m25,
+                SUM(CASE WHEN anio=2026 THEN monto ELSE 0 END) AS m26
               FROM base GROUP BY ccod
             ),
             -- Helper para subtotal por LIKE
             tot_like AS (
               SELECT
-                SUM(m25) FILTER (WHERE ccod LIKE '5.6.1.%') AS comu_25,
-                SUM(m26) FILTER (WHERE ccod LIKE '5.6.1.%') AS comu_26,
-                SUM(m25) FILTER (WHERE ccod LIKE '5.6.3.%') AS adm_25,
-                SUM(m26) FILTER (WHERE ccod LIKE '5.6.3.%') AS adm_26,
-                SUM(m25) FILTER (WHERE ccod LIKE '5.6.5.%') AS ti_25,
-                SUM(m26) FILTER (WHERE ccod LIKE '5.6.5.%') AS ti_26,
+                SUM(CASE WHEN ccod LIKE '5.6.1.%' THEN m25 ELSE 0 END) AS comu_25,
+                SUM(CASE WHEN ccod LIKE '5.6.1.%' THEN m26 ELSE 0 END) AS comu_26,
+                SUM(CASE WHEN ccod LIKE '5.6.3.%' THEN m25 ELSE 0 END) AS adm_25,
+                SUM(CASE WHEN ccod LIKE '5.6.3.%' THEN m26 ELSE 0 END) AS adm_26,
+                SUM(CASE WHEN ccod LIKE '5.6.5.%' THEN m25 ELSE 0 END) AS ti_25,
+                SUM(CASE WHEN ccod LIKE '5.6.5.%' THEN m26 ELSE 0 END) AS ti_26,
                 SUM(m25) AS tot_25,
                 SUM(m26) AS tot_26
               FROM m_x_cuenta
@@ -393,10 +449,10 @@ CUADROS: dict[str, dict[str, Any]] = {
             )
             SELECT
               rubro,
-              ROUND(m25::numeric, 0) AS monto_2025,
-              ROUND(m26::numeric, 0) AS monto_2026,
-              ROUND((m26 - m25)::numeric, 0) AS variacion,
-              ROUND((100.0 * (m26 - m25) / NULLIF(m25, 0))::numeric, 1) AS variacion_pct
+              ROUND(m25, 0) AS monto_2025,
+              ROUND(m26, 0) AS monto_2026,
+              ROUND((m26 - m25), 0) AS variacion,
+              ROUND((100.0 * (m26 - m25) / NULLIF(m25, 0)), 1) AS variacion_pct
             FROM filas
             ORDER BY orden
         """,
@@ -409,20 +465,20 @@ CUADROS: dict[str, dict[str, Any]] = {
         "sql": """
             SELECT
               INITCAP(c.descripcion) AS concepto,
-              ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END)::numeric, 0) AS aprobado,
-              ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END)::numeric, 0) AS ejecutado,
+              ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END), 0) AS aprobado,
+              ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END), 0) AS ejecutado,
               ROUND((100.0 * SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END) /
-                NULLIF(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END), 0))::numeric, 1) AS pct_ejecucion
+                NULLIF(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END), 0)), 1) AS pct_ejecucion
             FROM ejecucion.movimiento_dedup m
             JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
             JOIN catalogo.plan_presupuestario p ON p.id = m.plan_id
             JOIN catalogo.cuenta_planificacion c ON c.id = m.cuenta_id
             WHERE p.codigo = 'PRESUPBUSO'
-              AND EXTRACT(YEAR FROM m.fecha_movimiento) = 2025
+              AND YEAR(m.fecha_movimiento) = 2025
             GROUP BY c.descripcion
             HAVING SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END) > 0
                 OR SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END) > 0
-            ORDER BY aprobado DESC NULLS LAST
+            ORDER BY aprobado DESC
         """,
     },
     "cuadro-15-inversion-ti-2026": {
@@ -433,13 +489,13 @@ CUADROS: dict[str, dict[str, Any]] = {
         "sql": """
             SELECT
               INITCAP(c.descripcion) AS concepto,
-              ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END)::numeric, 0) AS monto
+              ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END), 0) AS monto
             FROM ejecucion.movimiento_dedup m
             JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
             JOIN catalogo.plan_presupuestario p ON p.id = m.plan_id
             JOIN catalogo.cuenta_planificacion c ON c.id = m.cuenta_id
             WHERE p.codigo = 'PRESUPBUSO'
-              AND EXTRACT(YEAR FROM m.fecha_movimiento) = 2026
+              AND YEAR(m.fecha_movimiento) = 2026
             GROUP BY c.descripcion
             HAVING SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END) > 0
             ORDER BY monto DESC
@@ -454,21 +510,21 @@ CUADROS: dict[str, dict[str, Any]] = {
             WITH base AS (
               SELECT
                 CASE
-                  WHEN c.path <@ CAST('n5.n5' AS ltree) THEN 'Reuniones Gobernanza'
-                  WHEN c.path <@ CAST('n5.n4' AS ltree) THEN 'Misiones de Servicio'
-                  WHEN c.path <@ CAST('n5.n3' AS ltree) THEN 'Servicios Profesionales a Término'
-                  WHEN c.path <@ CAST('n5.n2' AS ltree) THEN 'Gastos en Personal'
-                  WHEN c.path <@ CAST('n5.n6' AS ltree) THEN 'Gastos Operativos'
-                  WHEN c.path <@ CAST('n1.n7' AS ltree) THEN 'Presupuesto de Capital (TI)'
+                  WHEN (c.path = 'n5.n5' OR c.path LIKE 'n5.n5.%') THEN 'Reuniones Gobernanza'
+                  WHEN (c.path = 'n5.n4' OR c.path LIKE 'n5.n4.%') THEN 'Misiones de Servicio'
+                  WHEN (c.path = 'n5.n3' OR c.path LIKE 'n5.n3.%') THEN 'Servicios Profesionales a Término'
+                  WHEN (c.path = 'n5.n2' OR c.path LIKE 'n5.n2.%') THEN 'Gastos en Personal'
+                  WHEN (c.path = 'n5.n6' OR c.path LIKE 'n5.n6.%') THEN 'Gastos Operativos'
+                  WHEN (c.path = 'n1.n7' OR c.path LIKE 'n1.n7.%') THEN 'Presupuesto de Capital (TI)'
                   ELSE 'Otros'
                 END AS rubro,
                 CASE
-                  WHEN c.path <@ CAST('n5.n5' AS ltree) THEN 1
-                  WHEN c.path <@ CAST('n5.n4' AS ltree) THEN 2
-                  WHEN c.path <@ CAST('n5.n3' AS ltree) THEN 3
-                  WHEN c.path <@ CAST('n5.n2' AS ltree) THEN 4
-                  WHEN c.path <@ CAST('n5.n6' AS ltree) THEN 5
-                  WHEN c.path <@ CAST('n1.n7' AS ltree) THEN 6
+                  WHEN (c.path = 'n5.n5' OR c.path LIKE 'n5.n5.%') THEN 1
+                  WHEN (c.path = 'n5.n4' OR c.path LIKE 'n5.n4.%') THEN 2
+                  WHEN (c.path = 'n5.n3' OR c.path LIKE 'n5.n3.%') THEN 3
+                  WHEN (c.path = 'n5.n2' OR c.path LIKE 'n5.n2.%') THEN 4
+                  WHEN (c.path = 'n5.n6' OR c.path LIKE 'n5.n6.%') THEN 5
+                  WHEN (c.path = 'n1.n7' OR c.path LIKE 'n1.n7.%') THEN 6
                   ELSE 7
                 END AS orden,
                 tm.categoria AS cat,
@@ -478,20 +534,20 @@ CUADROS: dict[str, dict[str, Any]] = {
               JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
               JOIN catalogo.cuenta_planificacion c ON c.id = m.cuenta_id
               JOIN catalogo.plan_presupuestario p ON p.id = m.plan_id
-              WHERE EXTRACT(YEAR FROM m.fecha_movimiento) = 2025
+              WHERE YEAR(m.fecha_movimiento) = 2025
                 AND p.codigo = 'PRESUPDEGASTOS'
             )
             SELECT
               rubro,
-              ROUND(SUM(vig) FILTER (WHERE cat='inicial')::numeric, 0) AS aprobado,
-              ROUND(SUM(eje) FILTER (WHERE cat NOT IN ('inicial','modificacion'))::numeric, 0) AS ejecutado,
-              ROUND((SUM(vig) FILTER (WHERE cat='inicial')
-                   - SUM(eje) FILTER (WHERE cat NOT IN ('inicial','modificacion')))::numeric, 0) AS disponible,
-              ROUND((100.0 * SUM(eje) FILTER (WHERE cat NOT IN ('inicial','modificacion')) /
-                NULLIF(SUM(vig) FILTER (WHERE cat='inicial'), 0))::numeric, 1) AS pct_ejecucion
+              ROUND(SUM(CASE WHEN cat='inicial' THEN vig ELSE 0 END), 0) AS aprobado,
+              ROUND(SUM(CASE WHEN cat NOT IN ('inicial','modificacion') THEN eje ELSE 0 END), 0) AS ejecutado,
+              ROUND((SUM(CASE WHEN cat='inicial' THEN vig ELSE 0 END)
+                   - SUM(CASE WHEN cat NOT IN ('inicial','modificacion') THEN eje ELSE 0 END)), 0) AS disponible,
+              ROUND((100.0 * SUM(CASE WHEN cat NOT IN ('inicial','modificacion') THEN eje ELSE 0 END) /
+                NULLIF(SUM(CASE WHEN cat='inicial' THEN vig ELSE 0 END), 0)), 1) AS pct_ejecucion
             FROM base
             GROUP BY rubro, orden
-            HAVING SUM(vig) FILTER (WHERE cat='inicial') > 0
+            HAVING SUM(CASE WHEN cat='inicial' THEN vig ELSE 0 END) > 0
             ORDER BY orden
         """,
     },
@@ -537,7 +593,11 @@ async def get_cuadro(
         }
     except HTTPException:
         raise
-    except Exception as e:
+    except SQLAlchemyError as e:
+        # Si la query del cuadro falla (típicamente porque falta data o por un
+        # cambio de schema), devolvemos un objeto vacío con el error legible
+        # en `mensaje_error` en vez de propagar un 500. Esto evita que un
+        # cuadro roto rompa todo el dashboard del cliente.
         return {
             "codigo": codigo,
             "titulo": cuadro["titulo"],
@@ -565,11 +625,11 @@ async def get_cuadro(
 
 CATEGORIAS_DASHBOARD_SQL = """
   CASE
-    WHEN c.path <@ CAST('n5.n2' AS ltree) THEN 'Salarios y Beneficios'
-    WHEN c.path <@ CAST('n5.n3' AS ltree) THEN 'Consultores'
-    WHEN c.path <@ CAST('n5.n4' AS ltree) THEN 'Misiones de Servicio'
-    WHEN c.path <@ CAST('n5.n5' AS ltree) THEN 'Reuniones Gobernanza'
-    WHEN c.path <@ CAST('n5.n6' AS ltree) THEN 'Gastos Operativos'
+    WHEN (c.path = 'n5.n2' OR c.path LIKE 'n5.n2.%') THEN 'Salarios y Beneficios'
+    WHEN (c.path = 'n5.n3' OR c.path LIKE 'n5.n3.%') THEN 'Consultores'
+    WHEN (c.path = 'n5.n4' OR c.path LIKE 'n5.n4.%') THEN 'Misiones de Servicio'
+    WHEN (c.path = 'n5.n5' OR c.path LIKE 'n5.n5.%') THEN 'Reuniones Gobernanza'
+    WHEN (c.path = 'n5.n6' OR c.path LIKE 'n5.n6.%') THEN 'Gastos Operativos'
     ELSE 'Otros'
   END
 """
@@ -592,16 +652,16 @@ async def dashboard_institucional(
     if not snapshot:
         if ciclo_anio:
             snapshot = (await db.execute(text("""
-                SELECT snapshot_label FROM ejecucion.movimiento
-                WHERE EXTRACT(YEAR FROM fecha_movimiento) = :anio
+                SELECT TOP 1 snapshot_label FROM ejecucion.movimiento
+                WHERE YEAR(fecha_movimiento) = :anio
                 GROUP BY snapshot_label
-                ORDER BY MAX(snapshot_label) DESC LIMIT 1
+                ORDER BY MAX(snapshot_label) DESC
             """), {"anio": ciclo_anio})).scalar()
         if not snapshot:
             snapshot = (await db.execute(text("""
-                SELECT snapshot_label FROM ejecucion.movimiento
+                SELECT TOP 1 snapshot_label FROM ejecucion.movimiento
                 GROUP BY snapshot_label
-                ORDER BY MAX(snapshot_label) DESC LIMIT 1
+                ORDER BY MAX(snapshot_label) DESC
             """))).scalar() or "corte_2026_03"
 
     # Resolver ciclo target (dentro del snapshot)
@@ -612,15 +672,15 @@ async def dashboard_institucional(
         )).scalar()
     else:
         ciclo_id = (await db.execute(
-            text("""SELECT cp.id FROM core.ciclo_presupuestario cp
+            text("""SELECT TOP 1 cp.id FROM core.ciclo_presupuestario cp
                     WHERE EXISTS (SELECT 1 FROM ejecucion.movimiento_dedup m
                                   WHERE m.ciclo_id = cp.id AND m.snapshot_label = :s)
-                    ORDER BY cp.anio DESC LIMIT 1"""),
+                    ORDER BY cp.anio DESC"""),
             {"s": snapshot},
         )).scalar()
         if not ciclo_id:
             ciclo_id = (await db.execute(
-                text("SELECT id FROM core.ciclo_presupuestario ORDER BY anio DESC LIMIT 1")
+                text("SELECT TOP 1 id FROM core.ciclo_presupuestario ORDER BY anio DESC")
             )).scalar()
     if not ciclo_id:
         return {"error": "no hay ciclo", "totales": [], "matriz": []}
@@ -630,8 +690,8 @@ async def dashboard_institucional(
     # Totales por VP × categoría (subquery para poder usar el alias en GROUP BY)
     sql_matriz = text(f"""
         SELECT vp, categoria,
-               ROUND(SUM(aprobado)::numeric, 0)  AS aprobado,
-               ROUND(SUM(ejecutado)::numeric, 0) AS ejecutado
+               ROUND(SUM(aprobado), 0)  AS aprobado,
+               ROUND(SUM(ejecutado), 0) AS ejecutado
         FROM (
           SELECT
             m.vp_codigo AS vp,
@@ -653,8 +713,8 @@ async def dashboard_institucional(
     # KPIs institucionales (suma de TODO incluyendo movs sin VP — capital/fondo)
     sql_kpis = text("""
         SELECT
-          ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END)::numeric, 0) AS aprobado_total,
-          ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END)::numeric, 0) AS ejecutado_total,
+          ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END), 0) AS aprobado_total,
+          ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END), 0) AS ejecutado_total,
           COUNT(DISTINCT m.vp_codigo) AS vps,
           COUNT(*) AS movimientos
         FROM ejecucion.movimiento_dedup m
@@ -667,21 +727,20 @@ async def dashboard_institucional(
 
     # Top 8 cuentas por monto aprobado
     sql_top = text("""
-        SELECT
+        SELECT TOP 8
           c.codigo AS cuenta_codigo,
           c.descripcion AS cuenta,
-          ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END)::numeric, 0) AS aprobado,
-          ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END)::numeric, 0) AS ejecutado
+          ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END), 0) AS aprobado,
+          ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END), 0) AS ejecutado
         FROM ejecucion.movimiento_dedup m
         JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
         JOIN catalogo.cuenta_planificacion c ON c.id = m.cuenta_id
         JOIN catalogo.plan_presupuestario p ON p.id = m.plan_id
-        WHERE m.ciclo_id = :ciclo AND m.snapshot_label = :snap AND c.imputable
+        WHERE m.ciclo_id = :ciclo AND m.snapshot_label = :snap AND c.imputable = 1
           AND p.codigo = 'PRESUPDEGASTOS'
         GROUP BY c.codigo, c.descripcion
         HAVING SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END) > 0
         ORDER BY aprobado DESC
-        LIMIT 8
     """)
     top_cuentas = [dict(r) for r in (await db.execute(sql_top, params)).mappings().all()]
 
@@ -712,9 +771,9 @@ async def dashboard_por_vp(
         )).scalar()
     else:
         ciclo_id = (await db.execute(
-            text("""SELECT id FROM core.ciclo_presupuestario
+            text("""SELECT TOP 1 id FROM core.ciclo_presupuestario
                     WHERE estado IN ('vigente','planificacion')
-                    ORDER BY anio DESC LIMIT 1""")
+                    ORDER BY anio DESC""")
         )).scalar()
     if not ciclo_id:
         return {"error": "no hay ciclo"}
@@ -733,8 +792,8 @@ async def dashboard_por_vp(
     # Por categoría (subquery para alias en GROUP BY)
     sql_cat = text(f"""
         SELECT categoria,
-               ROUND(SUM(aprobado)::numeric, 0)  AS aprobado,
-               ROUND(SUM(ejecutado)::numeric, 0) AS ejecutado
+               ROUND(SUM(aprobado), 0)  AS aprobado,
+               ROUND(SUM(ejecutado), 0) AS ejecutado
         FROM (
           SELECT
             {CATEGORIAS_DASHBOARD_SQL} AS categoria,
@@ -748,7 +807,7 @@ async def dashboard_por_vp(
             AND p.codigo = 'PRESUPDEGASTOS'
         ) base
         GROUP BY categoria
-        ORDER BY aprobado DESC NULLS LAST
+        ORDER BY aprobado DESC
     """)
     por_categoria = [dict(r) for r in
                      (await db.execute(sql_cat, {"ciclo": ciclo_id, "vp": vp_nombre})).mappings().all()]
@@ -756,8 +815,8 @@ async def dashboard_por_vp(
     # KPIs
     sql_kpis = text("""
         SELECT
-          ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END)::numeric, 0) AS aprobado,
-          ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END)::numeric, 0) AS ejecutado,
+          ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END), 0) AS aprobado,
+          ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END), 0) AS ejecutado,
           COUNT(*) AS movimientos
         FROM ejecucion.movimiento_dedup m
         JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
@@ -769,19 +828,18 @@ async def dashboard_por_vp(
 
     # Top 10 cuentas
     sql_top = text("""
-        SELECT
+        SELECT TOP 10
           c.codigo AS cuenta_codigo,
           c.descripcion AS cuenta,
-          ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END)::numeric, 0) AS aprobado,
-          ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END)::numeric, 0) AS ejecutado
+          ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END), 0) AS aprobado,
+          ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END), 0) AS ejecutado
         FROM ejecucion.movimiento_dedup m
         JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
         JOIN catalogo.cuenta_planificacion c ON c.id = m.cuenta_id
-        WHERE m.ciclo_id = :ciclo AND m.vp_codigo = :vp AND c.imputable
+        WHERE m.ciclo_id = :ciclo AND m.vp_codigo = :vp AND c.imputable = 1
         GROUP BY c.codigo, c.descripcion
         HAVING SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END) > 0
         ORDER BY aprobado DESC
-        LIMIT 10
     """)
     top_cuentas = [dict(r) for r in
                    (await db.execute(sql_top, {"ciclo": ciclo_id, "vp": vp_nombre})).mappings().all()]
@@ -826,8 +884,8 @@ async def dashboard_historico(
 
     sql = text(f"""
         SELECT anio, vp, categoria,
-               ROUND(SUM(aprobado)::numeric, 0)  AS aprobado,
-               ROUND(SUM(ejecutado)::numeric, 0) AS ejecutado
+               ROUND(SUM(aprobado), 0)  AS aprobado,
+               ROUND(SUM(ejecutado), 0) AS ejecutado
         FROM (
           SELECT
             cp.anio AS anio,
@@ -898,18 +956,16 @@ async def drilldown_movimientos(
     if not snapshot:
         if ciclo_anio:
             snapshot = (await db.execute(text("""
-                SELECT snapshot_label FROM ejecucion.movimiento
-                WHERE EXTRACT(YEAR FROM fecha_movimiento) = :anio
+                SELECT TOP 1 snapshot_label FROM ejecucion.movimiento
+                WHERE YEAR(fecha_movimiento) = :anio
                 GROUP BY snapshot_label
                 ORDER BY MAX(snapshot_label) DESC
-                LIMIT 1
             """), {"anio": ciclo_anio})).scalar()
         if not snapshot:
             snapshot = (await db.execute(text("""
-                SELECT snapshot_label FROM ejecucion.movimiento
+                SELECT TOP 1 snapshot_label FROM ejecucion.movimiento
                 GROUP BY snapshot_label
                 ORDER BY MAX(snapshot_label) DESC
-                LIMIT 1
             """))).scalar() or "corte_2026_03"
 
     where = ["m.snapshot_label = :snap"]
@@ -924,10 +980,15 @@ async def drilldown_movimientos(
     if categoria:
         ltree_pref = _CATEGORIA_TO_LTREE.get(categoria)
         if ltree_pref:
-            where.append(f"c.path <@ CAST('{ltree_pref}' AS ltree)")
+            # Parametrizamos los valores aunque vengan de un dict del código:
+            # mantener bindparams en todos los puntos hace más fácil auditar
+            # que no hay inyección de SQL en este endpoint.
+            where.append("(c.path = :ltp OR c.path LIKE :ltp_like)")
+            params["ltp"] = ltree_pref
+            params["ltp_like"] = f"{ltree_pref}.%"
         else:
             # categoría arbitraria: filtramos por descripción
-            where.append("c.descripcion ILIKE :cat")
+            where.append("c.descripcion LIKE :cat")
             params["cat"] = f"%{categoria}%"
     if cuenta_codigo:
         where.append("c.codigo = :cc")
@@ -951,7 +1012,7 @@ async def drilldown_movimientos(
     where_sql = " AND ".join(where)
 
     sql_mov = text(f"""
-        SELECT
+        SELECT TOP (:limit)
           m.id, m.k2b_id, m.fecha_movimiento,
           cp.anio AS ciclo_anio,
           m.vp_codigo, m.area, m.centro_presupuestal, m.subcentro_presupuestal,
@@ -969,7 +1030,6 @@ async def drilldown_movimientos(
         LEFT JOIN catalogo.item_planificacion i ON i.id = m.item_id
         WHERE {where_sql}
         ORDER BY m.fecha_movimiento DESC, m.id DESC
-        LIMIT :limit
     """)
     params["limit"] = limit
     rows = [dict(r) for r in (await db.execute(sql_mov, params)).mappings().all()]
@@ -979,8 +1039,8 @@ async def drilldown_movimientos(
     sql_sum = text(f"""
         SELECT
           COUNT(*) AS total,
-          ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END)::numeric, 0) AS aprobado,
-          ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END)::numeric, 0) AS ejecutado
+          ROUND(SUM(CASE WHEN tm.categoria='inicial' THEN m.monto_vigente ELSE 0 END), 0) AS aprobado,
+          ROUND(SUM(CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END), 0) AS ejecutado
         FROM ejecucion.movimiento_dedup m
         JOIN core.ciclo_presupuestario cp ON cp.id = m.ciclo_id
         JOIN catalogo.tipo_movimiento tm ON tm.id = m.tipo_movimiento_id
@@ -1042,7 +1102,7 @@ async def comparativo_ciclos(db: AsyncSession = Depends(get_db)) -> dict[str, An
     plan_filas: list[dict[str, Any]] = []
     if ciclo_plan:
         sql_plan = text(f"""
-            SELECT vp, categoria, ROUND(SUM(monto)::numeric, 0) AS monto
+            SELECT vp, categoria, ROUND(SUM(monto), 0) AS monto
             FROM (
               SELECT
                 s.vp_codigo AS vp,
@@ -1059,7 +1119,10 @@ async def comparativo_ciclos(db: AsyncSession = Depends(get_db)) -> dict[str, An
         """).bindparams(cid=ciclo_plan["id"])
         try:
             plan_filas = [dict(r) for r in (await db.execute(sql_plan)).mappings().all()]
-        except Exception:
+        except SQLAlchemyError:
+            # Si la query plan falla (típicamente: no hay datos de planificación
+            # para ese ciclo), seguimos con lista vacía y el dashboard pinta
+            # solo el lado de ejecución.
             plan_filas = []
 
     # Vigente y ejecutado anterior: misma estructura desde ejecucion.movimiento
@@ -1068,7 +1131,7 @@ async def comparativo_ciclos(db: AsyncSession = Depends(get_db)) -> dict[str, An
         col  = "m.monto_vigente" if mode == "vigente" else "m.monto_ejecutado"
         # Mapeamos vp_codigo (nombre largo) a su código corto para uniformar
         sql = text(f"""
-            SELECT vp, categoria, ROUND(SUM(monto)::numeric, 0) AS monto
+            SELECT vp, categoria, ROUND(SUM(monto), 0) AS monto
             FROM (
               SELECT
                 CASE m.vp_codigo
@@ -1130,9 +1193,9 @@ async def calendario_ejecucion(
         )).scalar()
     else:
         ciclo_id = (await db.execute(
-            text("""SELECT cp.id FROM core.ciclo_presupuestario cp
+            text("""SELECT TOP 1 cp.id FROM core.ciclo_presupuestario cp
                     WHERE EXISTS (SELECT 1 FROM ejecucion.movimiento_dedup m WHERE m.ciclo_id = cp.id)
-                    ORDER BY cp.anio DESC LIMIT 1""")
+                    ORDER BY cp.anio DESC""")
         )).scalar()
     if not ciclo_id:
         return {"error": "sin ciclo"}
@@ -1145,11 +1208,11 @@ async def calendario_ejecucion(
 
     sql = text(f"""
         SELECT mes, categoria,
-               ROUND(SUM(monto)::numeric, 0) AS monto,
-               SUM(cnt)::int AS movimientos
+               ROUND(SUM(monto), 0) AS monto,
+               SUM(cnt) AS movimientos
         FROM (
           SELECT
-            EXTRACT(MONTH FROM m.fecha_movimiento)::int AS mes,
+            MONTH(m.fecha_movimiento) AS mes,
             {CATEGORIAS_DASHBOARD_SQL} AS categoria,
             CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN m.monto_ejecutado ELSE 0 END AS monto,
             CASE WHEN tm.categoria NOT IN ('inicial','modificacion') THEN 1 ELSE 0 END AS cnt
@@ -1173,4 +1236,3 @@ async def calendario_ejecucion(
         "vp_codigo": vp_codigo.upper() if vp_codigo else None,
         "filas": filas,
     }
-# touch Mon May 11 11:24:18 -04 2026

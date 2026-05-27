@@ -1,12 +1,30 @@
-"""Endpoints de solicitudes presupuestarias.
+"""Endpoints de solicitudes presupuestarias — el archivo más cargado del backend.
+
+Convive el CRUD de solicitudes y líneas con el workflow de aprobación, los
+snapshots, observaciones y adjuntos. No lo partí en módulos más chicos
+porque muchas funciones comparten los mismos helpers de lock y eventos —
+separarlos forzaría a importar mucho ida y vuelta para poca ganancia.
 
 Workflow:
-  1. Solicitante crea solicitud (etapa=0, estado=en_elaboracion)
-  2. Agrega líneas (cualquier planilla)
-  3. Envía a revisión (estado=enviado_revision, etapa=1)
-  4. Validador aprueba con objetivos (etapa=2) o devuelve (estado=devuelto)
-  5. Presidencia aprueba (etapa=3) o devuelve
-  6. Directorio aprueba (etapa=4, estado=aprobado) — final
+
+  Etapa 0  Elaboración              cargadores de la VP
+  Etapa 1  Revisión Vicepresidente  VP titular (PRE/GOB saltan a etapa 2)
+  Etapa 2  Revisión Presidencia     Presidente o Jefe de Gabinete
+  Etapa 3  Aprobado
+  Etapa 4  Cerrado (administrativo)
+
+En cada etapa hay 3 acciones: aprobar (sube), observar (vuelve a 0 con
+observaciones abiertas), devolver (vuelve a 0 sin observaciones específicas).
+Devolver u observar reconsume todo el ciclo: la solicitud tiene que pasar
+otra vez por VP y después Presidencia.
+
+Concurrencia: las operaciones de transición y los POST/PATCH/DELETE de líneas
+toman `WITH (UPDLOCK, ROWLOCK)` sobre la fila de la solicitud antes de actuar.
+Sin esto dos clicks paralelos a "Enviar a revisión" pueden ejecutar ambos, y
+un POST de línea concurrente puede colar una línea en una solicitud que se
+acaba de enviar (TOCTOU clásico). 
+PD: Cabe recalcar que este workflow no es el definido, fue planteado de tal manera 
+para mostrar la funcionalidad, se espera las necesidades levantadas por el grupo de trabajo.
 """
 from decimal import Decimal
 from typing import Any
@@ -20,7 +38,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -35,7 +53,7 @@ from app.domain.authz import (
     puede_enviar_a_revision,
     vp_salta_revision_vp,
 )
-from app.domain.calculo import calcular_monto_linea
+from app.domain.calculo import CalculoError, calcular_monto_linea
 from app.security import CurrentUser, get_current_user
 from app.domain.enums import (
     AccionEvento,
@@ -75,6 +93,13 @@ class LineaCrear(BaseModel):
     monto_solicitado: Decimal = Field(ge=0, decimal_places=2)
     justificacion: str | None = None
     usuario_id: int | None = None  # deprecado — JWT manda
+
+
+class LineaGrupoCrear(BaseModel):
+    """N líneas que forman una sola unidad visual (una 'misión' descompuesta en
+    pasajes/viáticos/hospedaje/etc.). Se crean en UNA transacción."""
+    model_config = {"extra": "forbid"}
+    lineas: list[LineaCrear] = Field(min_length=1, max_length=50)
 
 
 class LineaPatch(BaseModel):
@@ -117,13 +142,24 @@ async def _registrar_evento(
     payload: dict[str, Any] | None = None,
     comentario: str | None = None,
 ) -> None:
+    """Append-only en `planificacion.evento_solicitud` (audit log inmutable).
+
+    NO hace commit — el caller controla la transacción. Eso es a propósito:
+    si la operación que generó el evento falla después del INSERT, el rollback
+    también borra el evento, así no quedan eventos auditando acciones que no
+    se materializaron.
+
+    `payload` se serializa a JSON (NVARCHAR(MAX) en MSSQL) — sirve para grabar
+    detalles del request sin tener que agregar columnas. `default=str` cubre
+    Decimal y fechas que el cliente puede mandar.
+    """
     await db.execute(
         text(
             """INSERT INTO planificacion.evento_solicitud
                (solicitud_id, linea_id, accion, etapa_anterior, etapa_nueva,
                 estado_anterior, estado_nuevo, payload, usuario_id, comentario)
                VALUES (:sid, :lid, :acc, :ea, :en, :sa, :sn,
-                       CAST(:pl AS jsonb), :uid, :com)"""
+                       :pl, :uid, :com)"""
         ),
         {
             "sid": solicitud_id, "lid": linea_id, "acc": accion,
@@ -142,20 +178,28 @@ async def _crear_snapshot(
     motivo: str,
     usuario_id: int | None,
 ) -> int:
-    """Crea un snapshot inmutable del estado actual de la solicitud + todas sus líneas.
+    """Congela el estado actual de la solicitud + sus líneas (snapshot inmutable).
 
-    Se invoca desde `transicion` en hitos clave (envío a revisión, devolución
-    con observaciones, reaprobado tras ajustes, aprobación final) para soportar
-    la comparación Solicitado/Aprobado/Final en los dashboards.
+    Se llama desde `transicion` en momentos clave del workflow: envío a
+    revisión, devolución con observaciones, reaprobado post-ajustes,
+    aprobación final por Presidencia.
+
+    El propósito es reportería: los dashboards muestran "Solicitado vs
+    Aprobado vs Final" comparando los snapshots de cada hito. Si una solicitud
+    se aprueba y después se modifica (vía devolución u override admin),
+    sin los snapshots se perderían los montos históricos.
+
+    Los snapshots no se editan. Para corregir un snapshot equivocado, se
+    genera uno nuevo (con motivo='correccion_manual' o similar).
     """
     snap_id = (await db.execute(
         text(
             """INSERT INTO planificacion.snapshot_solicitud
                   (solicitud_id, etapa, motivo, monto_total, created_by)
-               SELECT s.id, :et, CAST(:mot AS planificacion.snapshot_motivo),
+               OUTPUT INSERTED.id
+               SELECT s.id, :et, :mot,
                       COALESCE(s.monto_total, 0), :uid
-               FROM planificacion.solicitud s WHERE s.id = :s
-               RETURNING id"""
+               FROM planificacion.solicitud s WHERE s.id = :s"""
         ),
         {"s": solicitud_id, "et": etapa, "mot": motivo, "uid": usuario_id},
     )).scalar()
@@ -180,21 +224,29 @@ async def _crear_snapshot(
 
 
 async def _recalc_total(db: AsyncSession, solicitud_id: int) -> None:
-    """Recalcula monto_total y monto_aprobado de la solicitud.
+    """Recalcula `monto_total` y `monto_aprobado` sumando todas las líneas.
 
-    Toma `FOR UPDATE` sobre la fila de la solicitud para serializar el cálculo
-    con concurrencias (ej. dos usuarios agregando líneas simultáneamente).
-    Las subqueries son atómicas dentro del UPDATE → no hay TOCTTOU.
+    Se llama después de cada POST/PATCH/DELETE de línea. Toma `WITH (UPDLOCK,
+    ROWLOCK)` para serializar contra otros recálculos concurrentes — dos
+    cargadores agregando líneas a la misma solicitud en paralelo pueden
+    pisarse el total (lost update clásico) si no se lockea.
+
+    El lock es liviano (una fila por solicitud, pocas operaciones concurrentes)
+    y las subqueries del UPDATE son atómicas dentro de la transacción.
+
+    `monto_aprobado` usa COALESCE(directorio, presidencia, objetivos, 0): el
+    monto "vigente" depende de hasta dónde haya llegado el workflow. Cuando
+    Presidencia aprueba se rellena `monto_presidencia` y eso pisa el aprobado.
     """
-    # Lock primero (rows escala bien con uno solo por solicitud)
+    # Lock la fila de la solicitud antes de leer-y-escribir.
     await db.execute(
-        text("SELECT id FROM planificacion.solicitud WHERE id=:s FOR UPDATE"),
+        text("SELECT id FROM planificacion.solicitud WITH (UPDLOCK, ROWLOCK) WHERE id=:s"),
         {"s": solicitud_id},
     )
     await db.execute(
         text(
             """UPDATE planificacion.solicitud SET
-                 monto_total    = COALESCE((SELECT SUM(monto_solicitado) FROM planificacion.linea_solicitud WHERE solicitud_id=:s), 0),
+                 monto_total    = COALESCE((SELECT SUM(monto_solicitado) FROM planificacion.linea_solicitud WITH (UPDLOCK, ROWLOCK) WHERE solicitud_id=:s), 0),
                  monto_aprobado = COALESCE((SELECT SUM(COALESCE(monto_directorio, monto_presidencia, monto_objetivos, 0))
                                             FROM planificacion.linea_solicitud WHERE solicitud_id=:s), 0)
                WHERE id=:s"""
@@ -226,7 +278,7 @@ async def crear_solicitud(p: SolicitudCrear, current: CurrentUser = Depends(get_
     # Regla de negocio: una sola solicitud por (ciclo, VP). Si ya existe,
     # devolvemos 409 con el id de la existente para que el frontend redirija.
     existente = (await db.execute(
-        text("SELECT id, nombre FROM planificacion.solicitud WHERE ciclo_id=:cid AND vp_codigo=:vp LIMIT 1"),
+        text("SELECT TOP 1 id, nombre FROM planificacion.solicitud WHERE ciclo_id=:cid AND vp_codigo=:vp"),
         {"cid": ciclo_id, "vp": p.vp_codigo},
     )).mappings().first()
     if existente:
@@ -244,8 +296,8 @@ async def crear_solicitud(p: SolicitudCrear, current: CurrentUser = Depends(get_
         text(
             """INSERT INTO planificacion.solicitud
                  (ciclo_id, vp_codigo, nombre, etapa_actual, estado_workflow, created_by)
-               VALUES (:cid, :vp, :nom, 0, 'en_elaboracion', :uid)
-               RETURNING id"""
+               OUTPUT INSERTED.id
+               VALUES (:cid, :vp, :nom, 0, 'en_elaboracion', :uid)"""
         ),
         {"cid": ciclo_id, "vp": p.vp_codigo, "nom": p.nombre, "uid": current.id},
     )).scalar_one()
@@ -276,7 +328,7 @@ async def listar_solicitudes(
                s.etapa_actual, s.estado_workflow,
                s.monto_total, s.monto_aprobado,
                s.created_at, s.updated_at,
-               u.nombre || ' ' || u.apellido AS creado_por,
+               u.nombre + ' ' + u.apellido AS creado_por,
                (SELECT COUNT(*) FROM planificacion.linea_solicitud WHERE solicitud_id=s.id) AS lineas_count
         FROM planificacion.solicitud s
         JOIN core.ciclo_presupuestario cp ON cp.id = s.ciclo_id
@@ -292,7 +344,7 @@ async def listar_solicitudes(
     # idempotente; si pide otra, no devuelve nada.
     if vp_codigo:
         sql += " AND s.vp_codigo = :vp"; params["vp"] = vp_codigo
-    sql += " ORDER BY s.updated_at DESC LIMIT :lim OFFSET :off"
+    sql += " ORDER BY s.updated_at DESC OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY"
     params["lim"] = limit
     params["off"] = offset
     rows = (await db.execute(text(sql), params)).mappings().all()
@@ -340,7 +392,7 @@ async def detalle_solicitud(sid: int, current: CurrentUser = Depends(get_current
         text("""
             SELECT s.*,
                    cp.anio AS ciclo_anio,
-                   u.nombre || ' ' || u.apellido AS creado_por,
+                   u.nombre + ' ' + u.apellido AS creado_por,
                    COALESCE((SELECT COUNT(*) FROM planificacion.snapshot_solicitud
                                WHERE solicitud_id = s.id
                                  AND motivo = 'devuelto_con_observaciones'), 0) AS devoluciones,
@@ -367,11 +419,10 @@ async def detalle_solicitud(sid: int, current: CurrentUser = Depends(get_current
         r in (current.roles or []) for r in ("presidente", "jefe_gabinete", "adm_sistema")
     )
     if current.planillas_extra and not es_de_su_vp and not es_revisor_global:
-        filtro_planilla = " AND pt.codigo = ANY(:pextra)"
+        filtro_planilla = " AND pt.codigo IN :pextra"
         params_lineas["pextra"] = current.planillas_extra
 
-    lineas = (await db.execute(
-        text(f"""SELECT l.id, l.planilla_template_id, pt.codigo AS planilla_codigo, pt.nombre AS planilla_nombre,
+    stmt_lineas = text(f"""SELECT l.id, l.planilla_template_id, pt.codigo AS planilla_codigo, pt.nombre AS planilla_nombre,
                        l.item_id, i.codigo AS item_codigo, i.descripcion AS item_descripcion,
                        l.cuenta_id, c.codigo AS cuenta_codigo, c.descripcion AS cuenta_descripcion,
                        l.gestor_id, g.nombre AS gestor_nombre,
@@ -380,8 +431,8 @@ async def detalle_solicitud(sid: int, current: CurrentUser = Depends(get_current
                        l.monto_solicitado, l.monto_objetivos, l.monto_presidencia, l.monto_directorio,
                        l.justificacion, l.estado_linea, l.observacion,
                        l.created_at, l.updated_at,
-                       uc.nombre || ' ' || uc.apellido AS created_by_nombre,
-                       COALESCE(uu.nombre || ' ' || uu.apellido, uc.nombre || ' ' || uc.apellido) AS updated_by_nombre
+                       uc.nombre + ' ' + uc.apellido AS created_by_nombre,
+                       COALESCE(uu.nombre + ' ' + uu.apellido, uc.nombre + ' ' + uc.apellido) AS updated_by_nombre
                 FROM planificacion.linea_solicitud l
                 JOIN catalogo.planilla_template pt ON pt.id = l.planilla_template_id
                 JOIN catalogo.item_planificacion i ON i.id = l.item_id
@@ -391,16 +442,19 @@ async def detalle_solicitud(sid: int, current: CurrentUser = Depends(get_current
                 LEFT JOIN core.usuario uc ON uc.id = l.created_by
                 LEFT JOIN core.usuario uu ON uu.id = l.updated_by
                 WHERE l.solicitud_id=:s{filtro_planilla}
-                ORDER BY l.id"""),
-        params_lineas,
-    )).mappings().all()
+                ORDER BY l.id""")
+    if "pextra" in params_lineas:
+        # `IN :pextra` requiere bindparam(expanding=True) para que SQLAlchemy
+        # materialice la lista como IN (?, ?, ?) ejecutable por pyodbc/aioodbc.
+        stmt_lineas = stmt_lineas.bindparams(bindparam("pextra", expanding=True))
+    lineas = (await db.execute(stmt_lineas, params_lineas)).mappings().all()
 
     eventos = (await db.execute(
-        text("""SELECT e.*, u.nombre || ' ' || u.apellido AS usuario_nombre
+        text("""SELECT TOP 100 e.*, u.nombre + ' ' + u.apellido AS usuario_nombre
                 FROM planificacion.evento_solicitud e
                 LEFT JOIN core.usuario u ON u.id = e.usuario_id
                 WHERE e.solicitud_id=:s
-                ORDER BY e.created_at DESC LIMIT 100"""),
+                ORDER BY e.created_at DESC"""),
         {"s": sid},
     )).mappings().all()
 
@@ -436,7 +490,7 @@ async def actividad_reciente(
         where_sql = "WHERE " + scope_sql.strip().removeprefix("AND ").strip()
     rows = (await db.execute(
         text(
-            f"""SELECT e.id, e.solicitud_id, e.linea_id, e.accion, e.payload,
+            f"""SELECT TOP (:lim) e.id, e.solicitud_id, e.linea_id, e.accion, e.payload,
                        e.estado_anterior, e.estado_nuevo,
                        e.etapa_anterior, e.etapa_nueva,
                        e.created_at, e.comentario,
@@ -453,28 +507,27 @@ async def actividad_reciente(
                   LEFT JOIN catalogo.planilla_template pt ON pt.id = l.planilla_template_id
                   LEFT JOIN catalogo.cuenta_planificacion c ON c.id = l.cuenta_id
                   {where_sql}
-                  ORDER BY e.created_at DESC
-                  LIMIT :lim"""
+                  ORDER BY e.created_at DESC"""
         ),
         params,
     )).mappings().all()
     return [dict(r) for r in rows]
 
 
-@router.post("/solicitudes/{sid}/lineas")
-async def agregar_linea(sid: int, p: LineaCrear, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    # FOR UPDATE: bloquea la fila de la solicitud durante todo este POST. Si en
-    # paralelo alguien ejecutó una transición (p.ej. "Enviar al VP"), nuestra
-    # lectura espera al COMMIT, vemos el estado actualizado y el check siguiente
-    # rechaza con 409 — sin esto un cargador podía colar líneas en una solicitud
-    # ya enviada a revisión.
-    s = (await db.execute(
-        text("SELECT id, estado_workflow, vp_codigo FROM planificacion.solicitud WHERE id=:s FOR UPDATE"),
-        {"s": sid},
-    )).mappings().first()
-    if not s:
-        raise HTTPException(404, "Solicitud no encontrada")
+async def _insertar_linea(
+    db: AsyncSession,
+    sid: int,
+    vp_codigo: str,
+    p: LineaCrear,
+    current_id: int,
+) -> int:
+    """Inserta UNA línea y registra el evento — SIN commit ni `_recalc_total`.
 
+    Reúne authz por planilla, validación de la matriz item↔cuenta, resolución de
+    gestor y cálculo autoritativo del monto. El llamador debe ejecutar
+    `_recalc_total` + `db.commit()`. Diferir el commit permite que el endpoint de
+    grupo cree N líneas en UNA transacción: si una falla, ninguna persiste.
+    """
     # Authz unificado (helper único — drift impossible)
     pt_codigo = (await db.execute(
         text("SELECT codigo FROM catalogo.planilla_template WHERE id=:t"),
@@ -482,22 +535,21 @@ async def agregar_linea(sid: int, p: LineaCrear, current: CurrentUser = Depends(
     )).scalar()
     if not pt_codigo:
         raise HTTPException(400, f"Planilla {p.planilla_template_id} no existe")
-    if not await puede_acceder_planilla(db, current.id, s["vp_codigo"], pt_codigo):
+    if not await puede_acceder_planilla(db, current_id, vp_codigo, pt_codigo):
         raise HTTPException(
             status_code=403,
             detail=f"Tu rol no puede agregar líneas a la planilla '{pt_codigo}' "
-                   f"en una solicitud de {s['vp_codigo']}.",
+                   f"en una solicitud de {vp_codigo}.",
         )
-
-    if s["estado_workflow"] not in ESTADOS_EDITABLES:
-        raise HTTPException(409, f"No se puede agregar líneas en estado '{s['estado_workflow']}'")
 
     # Validar matriz item↔cuenta — RECHAZA combinaciones no listadas en catalogo.relacion_item_cuenta
     # (346 pares oficiales DPP). El frontend ya filtra opciones; este es el guard duro de servidor.
+    # MSSQL no permite `EXISTS(...)` como expresión escalar — usamos CASE.
     chk = (await db.execute(text("""
         SELECT i.codigo AS item_codigo, c.codigo AS cuenta_codigo,
-               EXISTS(SELECT 1 FROM catalogo.relacion_item_cuenta r
-                      WHERE r.item_id=:i AND r.cuenta_id=:c) AS valida
+               CASE WHEN EXISTS(SELECT 1 FROM catalogo.relacion_item_cuenta r
+                                WHERE r.item_id=:i AND r.cuenta_id=:c)
+                    THEN 1 ELSE 0 END AS valida
         FROM catalogo.item_planificacion i, catalogo.cuenta_planificacion c
         WHERE i.id=:i AND c.id=:c
     """), {"i": p.item_id, "c": p.cuenta_id})).mappings().first()
@@ -524,49 +576,99 @@ async def agregar_linea(sid: int, p: LineaCrear, current: CurrentUser = Depends(
         gestor_id_final = (await db.execute(
             text("""
                 SELECT COALESCE(
-                  (SELECT gi.gestor_id FROM catalogo.gestor_item gi WHERE gi.item_id = :i LIMIT 1),
+                  (SELECT TOP 1 gi.gestor_id FROM catalogo.gestor_item gi WHERE gi.item_id = :i),
                   (SELECT gi.gestor_id FROM catalogo.gestor_item gi
-                     WHERE gi.item_id = (SELECT parent_id FROM catalogo.item_planificacion WHERE id = :i)
-                     LIMIT 1)
+                     WHERE gi.item_id = (SELECT TOP 1 parent_id FROM catalogo.item_planificacion WHERE id = :i))
                 )
             """),
             {"i": p.item_id},
         )).scalar()
 
     # AUTORIDAD DEL BACKEND: recalculamos `monto_solicitado` desde los parámetros,
-    # la cuenta destino y las tarifas oficiales (catalogo.tarifa_*). El monto
-    # del payload del cliente es solo un hint para captura directa.
-    monto_calculado = await calcular_monto_linea(
-        db,
-        planilla_codigo=pt_codigo,
-        cuenta_codigo=chk["cuenta_codigo"],
-        parametros=p.parametros,
-        monto_hint=p.monto_solicitado,
-    )
+    # la cuenta destino y las tarifas oficiales (catalogo.tarifa_*). El monto del
+    # payload del cliente es solo un hint para captura directa; si la línea es
+    # parametrizada y la tarifa no existe, `calcular_monto_linea` lanza
+    # CalculoError → 422 (no se acepta el hint del cliente).
+    try:
+        monto_calculado = await calcular_monto_linea(
+            db,
+            planilla_codigo=pt_codigo,
+            cuenta_codigo=chk["cuenta_codigo"],
+            parametros=p.parametros,
+            monto_hint=p.monto_solicitado,
+        )
+    except CalculoError as e:
+        raise HTTPException(422, str(e))
 
     nueva_id = (await db.execute(
         text("""INSERT INTO planificacion.linea_solicitud
                   (solicitud_id, planilla_template_id, item_id, cuenta_id, gestor_id, plan_id,
                    modalidad, formula_codigo, parametros,
                    monto_solicitado, justificacion, created_by)
+                OUTPUT INSERTED.id
                 VALUES (:s, :pt, :i, :c, :g, :pl,
-                        :mod, :fc, CAST(:pr AS jsonb),
-                        :ms, :j, :u)
-                RETURNING id"""),
+                        :mod, :fc, :pr,
+                        :ms, :j, :u)"""),
         {"s": sid, "pt": p.planilla_template_id, "i": p.item_id, "c": p.cuenta_id,
          "g": gestor_id_final, "pl": plan_id, "mod": p.modalidad, "fc": p.formula_codigo,
          "pr": json.dumps(p.parametros), "ms": monto_calculado, "j": p.justificacion,
-         "u": current.id},
+         "u": current_id},
     )).scalar_one()
 
     await _registrar_evento(
-        db, sid, "agregar_linea", current.id, linea_id=nueva_id,
+        db, sid, "agregar_linea", current_id, linea_id=nueva_id,
         payload={"monto_solicitado": str(monto_calculado), "item_id": p.item_id, "cuenta_id": p.cuenta_id,
                  "hint_cliente": str(p.monto_solicitado)},
     )
+    return int(nueva_id)
+
+
+@router.post("/solicitudes/{sid}/lineas")
+async def agregar_linea(sid: int, p: LineaCrear, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    #: bloquea la fila de la solicitud durante todo este POST. Si en
+    # paralelo alguien ejecutó una transición (p.ej. "Enviar al VP"), nuestra
+    # lectura espera al COMMIT, vemos el estado actualizado y el check siguiente
+    # rechaza con 409 — sin esto un cargador podía colar líneas en una solicitud
+    # ya enviada a revisión.
+    s = (await db.execute(
+        text("SELECT id, estado_workflow, vp_codigo FROM planificacion.solicitud WITH (UPDLOCK, ROWLOCK) WHERE id=:s"),
+        {"s": sid},
+    )).mappings().first()
+    if not s:
+        raise HTTPException(404, "Solicitud no encontrada")
+    if s["estado_workflow"] not in ESTADOS_EDITABLES:
+        raise HTTPException(409, f"No se puede agregar líneas en estado '{s['estado_workflow']}'")
+
+    nueva_id = await _insertar_linea(db, sid, s["vp_codigo"], p, current.id)
     await _recalc_total(db, sid)
     await db.commit()
     return {"id": nueva_id, "solicitud_id": sid}
+
+
+@router.post("/solicitudes/{sid}/lineas-grupo")
+async def agregar_lineas_grupo(sid: int, p: LineaGrupoCrear, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Crea N líneas (una 'misión' descompuesta por cuenta) en UNA transacción.
+
+    Atomicidad: si la creación de cualquier línea falla (combinación inválida,
+    tarifa faltante, authz), se aborta TODO el grupo — ninguna línea persiste.
+    Evita las 'misiones partidas' que dejaba el frontend al crear las líneas
+    una por una con un loop sin rollback.
+    """
+    s = (await db.execute(
+        text("SELECT id, estado_workflow, vp_codigo FROM planificacion.solicitud WITH (UPDLOCK, ROWLOCK) WHERE id=:s"),
+        {"s": sid},
+    )).mappings().first()
+    if not s:
+        raise HTTPException(404, "Solicitud no encontrada")
+    if s["estado_workflow"] not in ESTADOS_EDITABLES:
+        raise HTTPException(409, f"No se puede agregar líneas en estado '{s['estado_workflow']}'")
+
+    ids: list[int] = []
+    for linea in p.lineas:
+        ids.append(await _insertar_linea(db, sid, s["vp_codigo"], linea, current.id))
+    await _recalc_total(db, sid)
+    await db.commit()
+    return {"solicitud_id": sid, "ids": ids}
 
 
 @router.patch("/lineas/{lid}")
@@ -577,16 +679,16 @@ async def modificar_linea(lid: int, p: LineaPatch, current: CurrentUser = Depend
     if not ok:
         raise HTTPException(403, f"Tu rol no puede modificar líneas de {vp_sol}.")
     actual = (await db.execute(
-        text("SELECT * FROM planificacion.linea_solicitud WHERE id=:l"),
+        text("SELECT * FROM planificacion.linea_solicitud WITH (UPDLOCK, ROWLOCK) WHERE id=:l"),
         {"l": lid},
     )).mappings().first()
 
     # Guard: solo permitir modificar líneas en estados editables del workflow.
-    # FOR UPDATE serializa contra transiciones concurrentes (mismo motivo que
+    # serializa contra transiciones concurrentes (mismo motivo que
     # agregar_linea — evita lost update / TOCTOU si alguien envió a revisión
     # entre que el cliente leyó y mandó el PATCH).
     estado = (await db.execute(
-        text("SELECT estado_workflow FROM planificacion.solicitud WHERE id=:s FOR UPDATE"),
+        text("SELECT estado_workflow FROM planificacion.solicitud WITH (UPDLOCK, ROWLOCK) WHERE id=:s"),
         {"s": actual["solicitud_id"]},
     )).scalar()
     if estado not in ESTADOS_EDITABLES:
@@ -621,13 +723,16 @@ async def modificar_linea(lid: int, p: LineaPatch, current: CurrentUser = Depend
         parametros_efectivos = dict(actual.get("parametros") or {})
         if "parametros" in cambios:
             parametros_efectivos.update(cambios["parametros"])
-        monto_calc = await calcular_monto_linea(
-            db,
-            planilla_codigo=pt_codigo or "",
-            cuenta_codigo=cuenta_codigo or "",
-            parametros=parametros_efectivos,
-            monto_hint=cambios.get("monto_solicitado", actual.get("monto_solicitado")),
-        )
+        try:
+            monto_calc = await calcular_monto_linea(
+                db,
+                planilla_codigo=pt_codigo or "",
+                cuenta_codigo=cuenta_codigo or "",
+                parametros=parametros_efectivos,
+                monto_hint=cambios.get("monto_solicitado", actual.get("monto_solicitado")),
+            )
+        except CalculoError as e:
+            raise HTTPException(422, str(e))
         cambios["monto_solicitado"] = monto_calc
 
     if not cambios:
@@ -637,7 +742,8 @@ async def modificar_linea(lid: int, p: LineaPatch, current: CurrentUser = Depend
     params: dict[str, Any] = {"l": lid, "u": current.id}
     for k, v in cambios.items():
         if k == "parametros":
-            sets.append(f"{k} = CAST(:p_{k} AS jsonb)")
+            # `parametros` es NVARCHAR(MAX) en MSSQL — basta con el JSON serializado.
+            sets.append(f"{k} = :p_{k}")
             import json
             params[f"p_{k}"] = json.dumps(v)
         else:
@@ -669,20 +775,20 @@ async def eliminar_linea(lid: int, current: CurrentUser = Depends(get_current_us
     if not ok:
         raise HTTPException(403, f"Tu rol no puede eliminar líneas de {vp_sol}.")
     actual = (await db.execute(
-        text("SELECT * FROM planificacion.linea_solicitud WHERE id=:l"),
+        text("SELECT * FROM planificacion.linea_solicitud WITH (UPDLOCK, ROWLOCK) WHERE id=:l"),
         {"l": lid},
     )).mappings().first()
 
     # Guard: no permitir eliminar líneas de solicitudes ya aprobadas/cerradas
-    # FOR UPDATE serializa contra transiciones concurrentes.
+    # serializa contra transiciones concurrentes.
     estado = (await db.execute(
-        text("SELECT estado_workflow FROM planificacion.solicitud WHERE id=:s FOR UPDATE"),
+        text("SELECT estado_workflow FROM planificacion.solicitud WITH (UPDLOCK, ROWLOCK) WHERE id=:s"),
         {"s": actual["solicitud_id"]},
     )).scalar()
     if estado not in ESTADOS_EDITABLES:
         raise HTTPException(409, f"No se puede eliminar líneas en estado '{estado}'.")
 
-    await db.execute(text("DELETE FROM planificacion.linea_solicitud WHERE id=:l"), {"l": lid})
+    await db.execute(text("DELETE FROM planificacion.linea_solicitud WITH (UPDLOCK, ROWLOCK) WHERE id=:l"), {"l": lid})
     await _registrar_evento(
         db, actual["solicitud_id"], "eliminar_linea", current.id,
         payload={"item_id": actual["item_id"], "cuenta_id": actual["cuenta_id"], "monto": str(actual["monto_solicitado"])},
@@ -692,28 +798,94 @@ async def eliminar_linea(lid: int, current: CurrentUser = Depends(get_current_us
     return {"id": lid, "deleted": True}
 
 
-# Mapa de transiciones permitidas — nuevo workflow con Vicepresidente intermedio.
+@router.delete("/solicitudes/{sid}/lineas-grupo/{grupo_id}")
+async def eliminar_lineas_grupo(sid: int, grupo_id: str, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Borra todas las líneas de un grupo (una 'misión') en UNA transacción.
+
+    Atomicidad: el DELETE es una sola sentencia — o se borran todas las líneas
+    del grupo o ninguna. Evita las 'misiones partidas' que dejaba el frontend al
+    borrar las líneas una por una con un loop sin rollback.
+    """
+    s = (await db.execute(
+        text("SELECT estado_workflow, vp_codigo FROM planificacion.solicitud WHERE id=:s"),
+        {"s": sid},
+    )).mappings().first()
+    if not s:
+        raise HTTPException(404, "Solicitud no encontrada")
+    if s["estado_workflow"] not in ESTADOS_EDITABLES:
+        raise HTTPException(409, f"No se puede eliminar líneas en estado '{s['estado_workflow']}'.")
+
+    # `grupo_id` vive dentro de parametros (JSONB). Resolvemos las líneas del grupo.
+    lineas = (await db.execute(
+        text("""SELECT l.id, l.item_id, l.cuenta_id, l.monto_solicitado, pt.codigo AS planilla
+                FROM planificacion.linea_solicitud l
+                JOIN catalogo.planilla_template pt ON pt.id = l.planilla_template_id
+                WHERE l.solicitud_id = :s AND JSON_VALUE(l.parametros, '$.grupo_id') = :g"""),
+        {"s": sid, "g": grupo_id},
+    )).mappings().all()
+    if not lineas:
+        raise HTTPException(404, "Grupo de líneas no encontrado")
+
+    # Authz: el usuario debe poder acceder a cada planilla involucrada en el grupo.
+    for planilla in {l["planilla"] for l in lineas}:
+        if not await puede_acceder_planilla(db, current.id, s["vp_codigo"], planilla):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Tu rol no puede eliminar líneas de la planilla '{planilla}' "
+                       f"en una solicitud de {s['vp_codigo']}.",
+            )
+
+    await db.execute(
+        text("DELETE FROM planificacion.linea_solicitud "
+             "WHERE solicitud_id = :s AND JSON_VALUE(parametros, '$.grupo_id') = :g"),
+        {"s": sid, "g": grupo_id},
+    )
+    for l in lineas:
+        await _registrar_evento(
+            db, sid, "eliminar_linea", current.id,
+            payload={"item_id": l["item_id"], "cuenta_id": l["cuenta_id"],
+                     "monto": str(l["monto_solicitado"]), "grupo_id": grupo_id},
+        )
+    await _recalc_total(db, sid)
+    await db.commit()
+    return {"solicitud_id": sid, "grupo_id": grupo_id, "deleted": len(lineas)}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Mapa de transiciones permitidas — el cerebro del workflow.
+# ────────────────────────────────────────────────────────────────────────────
 #
-#   Etapa 0: Elaboración (cargadores de la VP)
-#   Etapa 1: Revisión Vicepresidente
-#   Etapa 2: Revisión Presidencia (Presidenta / Jefe Gabinete)
-#   Etapa 3: Aprobado
-#   Etapa 4: Cerrado
+# Una entrada = una "acción" que el frontend puede mandar. La acción define:
+#   - desde qué etapa puede dispararse (`de_etapa`)
+#   - desde qué estados (`estados_validos`)
+#   - a qué estado/etapa va (`estado_destino`, `etapa_destino`)
+#   - qué columna de timestamp setear (`timestamp_col`)
+#   - qué rol valida la acción (`rbac`: 'enviar' | 'vp' | 'presidencia')
+#   - si la acción "congela" monto (copiar de un campo a otro)
 #
-# Estados editables (cargadores pueden modificar líneas):
+# Etapas:
+#   0 Elaboración        cargadores trabajan
+#   1 Revisión VP        Vicepresidente titular acepta/observa/devuelve
+#                        (PRE y GOB saltan esta etapa — ver `solo_vp_sin_vicepresidente`)
+#   2 Revisión Presid.   Presidenta o Jefe de Gabinete acepta/observa/devuelve
+#   3 Aprobado           ya está firme; va al pre-cierre administrativo
+#   4 Cerrado            inmutable, solo entra al histórico
+#
+# Estados que permiten editar líneas (ESTADOS_EDITABLES en domain/enums.py):
 #   en_elaboracion, observado_vp, devuelto_vp,
 #   observado_presidencia, devuelto_presidencia.
-# (Definidos en app.domain.enums.ESTADOS_EDITABLES — actualizar en paralelo.)
+# Cualquier otro estado bloquea POST/PATCH/DELETE de líneas (lo chequea el
+# endpoint de cada operación antes de tocar nada).
 #
-# Cada transición valida (a) etapa, (b) estado actual y (c) RBAC por rol/VP.
-# En cada aprobación se "congela" el monto copiando al campo destino. Los
-# campos viejos (monto_objetivos, monto_directorio) quedan deprecated.
+# Congelado de montos:
+#   Cuando una etapa aprueba, el monto vigente se copia a un campo separado
+#   (`monto_vp`, `monto_presidencia`) y queda inmutable. Si después se devuelve
+#   la solicitud por observaciones y el cargador edita `monto_solicitado`,
+#   el monto aprobado original sigue intacto en su campo.
 #
-# Estados nuevos:
-#   en_revision_vp / observado_vp / devuelto_vp
-#   en_revision_presidencia / observado_presidencia / devuelto_presidencia
-# (Los viejos enviado_revision/en_revision/validado/observado/devuelto quedan
-#  como legacy — no se emiten desde el código nuevo pero el enum los acepta.)
+# Estados legacy: el enum acepta `enviado_revision`, `en_revision`, `validado`,
+# `observado`, `devuelto` por compatibilidad con datos viejos. El código nuevo
+# no los emite — si ves una solicitud con esos estados es histórica.
 TRANSICIONES: dict[str, dict[str, Any]] = {
     # --- ETAPA 0 → 1: cargadores envían al VP ----------------------------
     "enviar_a_revision_vp": {
@@ -839,18 +1011,41 @@ def _verifica_rbac(
 
 @router.post("/solicitudes/{sid}/transicion")
 async def transicion(sid: int, p: TransicionIn, current: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Dispara una transición del workflow.
+
+    Esta función concentra MUCHO: lee la solicitud con lock, valida etapa/estado/
+    rol, ejecuta la transición, congela montos si corresponde, registra el evento,
+    y genera snapshot. Si algo falla todo queda dentro de una transacción y se
+    revierte al final.
+
+    Orden de los chequeos (importa):
+      1) Authz general: ¿puede tocar esta solicitud? (404/403)
+      2) Lock + lectura del estado actual
+      3) Acción válida en el mapa
+      4) Etapa actual habilita la acción
+      5) Estado actual habilita la acción
+      6) RBAC: el rol del usuario puede ejecutar este TIPO de acción
+      7) Reglas especiales (PRE/GOB no usa enviar_a_revision_vp)
+      8) Observaciones abiertas: bloquean reenvíos, exigen 1+ para observar
+      9) UPDATE solicitud (estado, etapa, timestamp)
+     10) Congelar monto si corresponde (copia monto_X → campo destino en líneas)
+     11) Registrar evento
+     12) Snapshot automático si la transición es un hito
+    """
     ok, vp_sol = await puede_acceder_solicitud(db, current.id, sid)
     if vp_sol is None:
         raise HTTPException(404, "Solicitud no encontrada")
     if not ok:
         raise HTTPException(403, f"Tu rol no puede ejecutar transiciones sobre solicitudes de {vp_sol}.")
-    # FOR UPDATE: serializa esta transición contra otras transiciones simultáneas
-    # y contra POST/PATCH/DELETE de líneas (que también toman lock — ver
-    # agregar/modificar/eliminar_linea). Sin esto, dos clicks paralelos de
-    # "Enviar a revisión" o un POST de línea concurrente al envío podían dejar
-    # filas en una solicitud ya transicionada (TOCTOU).
+    # Lock pesimista: serializa esta transición contra otras transiciones y
+    # contra POST/PATCH/DELETE de líneas concurrentes. Sin esto, dos clicks
+    # en "Enviar a revisión" pueden ejecutarse ambos (evento duplicado), y un
+    # POST de línea entrando justo cuando otra request envió la solicitud
+    # puede dejar la línea en una solicitud ya "en revisión" (estado no
+    # editable). `WITH (UPDLOCK, ROWLOCK)` es el equivalente MSSQL del
+    # `FOR UPDATE` de PG.
     s = (await db.execute(
-        text("SELECT * FROM planificacion.solicitud WHERE id=:s FOR UPDATE"),
+        text("SELECT * FROM planificacion.solicitud WITH (UPDLOCK, ROWLOCK) WHERE id=:s"),
         {"s": sid},
     )).mappings().first()
 
@@ -921,7 +1116,7 @@ async def transicion(sid: int, p: TransicionIn, current: CurrentUser = Depends(g
         sets.append("etapa_actual = :etapa")
         params["etapa"] = cfg["etapa_destino"]
     if cfg.get("timestamp_col"):
-        sets.append(f"{cfg['timestamp_col']} = now()")
+        sets.append(f"{cfg['timestamp_col']} = SYSDATETIMEOFFSET()")
     if p.comentario:
         sets.append("comentario_actual = :com")
         params["com"] = p.comentario
@@ -931,16 +1126,24 @@ async def transicion(sid: int, p: TransicionIn, current: CurrentUser = Depends(g
         params,
     )
 
-    # CONGELAR montos: al aprobar una etapa, copia el monto del campo anterior al de la etapa.
-    # Esto garantiza que el aprobado quede inmutable aunque alguien edite monto_solicitado luego.
-    # `congelar_origen` puede ser un nombre de columna ("monto_solicitado") o una expresión
-    # SQL completa ("COALESCE(monto_vp, monto_solicitado)") para soportar el caso PRE/GOB
-    # donde la solicitud salta la etapa VP y monto_vp queda NULL.
+    # Congelar montos al aprobar una etapa. Copiamos el monto "vigente" a un
+    # campo específico de la etapa (`monto_vp`, `monto_presidencia`) para que
+    # quede inmutable. Si después el flujo se devuelve por observaciones y el
+    # cargador edita `monto_solicitado`, el monto que se firmó en cada etapa
+    # sigue accesible en su campo correspondiente.
+    #
+    # `congelar_origen` puede ser:
+    #   - nombre de columna ("monto_solicitado") → lo envolvemos en COALESCE.
+    #   - expresión SQL ("COALESCE(monto_vp, monto_solicitado)") → para los
+    #     casos donde la VP saltó etapa 1 y `monto_vp` está NULL: el COALESCE
+    #     cae a `monto_solicitado`.
     origen = cfg.get("congelar_origen")
     destino = cfg.get("congelar_destino")
     if origen and destino:
-        # Si la expresión no contiene paréntesis ni espacios, es un nombre de columna
-        # y lo envolvemos en COALESCE(_, 0). Si ya viene como expresión, lo dejamos.
+        # Heurística para distinguir "nombre de columna" de "expresión":
+        # si tiene paréntesis o espacios es expresión. En cualquier caso
+        # envolvemos en COALESCE(_, 0) — los NULLs en estos campos rompen
+        # los SUM() de la reportería.
         if "(" in origen or " " in origen:
             origen_expr = f"COALESCE({origen}, 0)"
         else:
@@ -951,7 +1154,7 @@ async def transicion(sid: int, p: TransicionIn, current: CurrentUser = Depends(g
                      WHERE solicitud_id = :s"""),
             {"s": sid},
         )
-        # Recalcular monto_aprobado de la solicitud usando el nuevo campo destino
+        # Y recalculamos el monto_aprobado total con los valores recién congelados.
         await _recalc_total(db, sid)
 
     await _registrar_evento(
@@ -1071,7 +1274,8 @@ async def subir_adjunto_linea(
         text(
             """INSERT INTO planificacion.adjunto_linea
                (linea_id, nombre_original, tipo_mime, tamano_bytes, path_relativo, subido_por)
-               VALUES (:l, :n, :m, :t, :p, :u) RETURNING id"""
+               OUTPUT INSERTED.id
+               VALUES (:l, :n, :m, :t, :p, :u)"""
         ),
         {"l": lid, "n": archivo.filename or "archivo", "m": mime,
          "t": len(data), "p": rel_path, "u": current.id},
@@ -1377,10 +1581,10 @@ async def crear_observacion(
             """INSERT INTO planificacion.observacion
                   (solicitud_id, linea_id, planilla_template_id, alcance, texto,
                    accion_sugerida, valor_sugerido, etapa_origen, created_by)
-               VALUES (:s, :l, :p, CAST(:al AS planificacion.observacion_alcance), :t,
-                       CAST(:ac AS planificacion.observacion_accion),
-                       CAST(:v AS jsonb), :eo, :uid)
-               RETURNING id"""
+               OUTPUT INSERTED.id
+               VALUES (:s, :l, :p, :al, :t,
+                       :ac,
+                       :v, :eo, :uid)"""
         ),
         {"s": sid, "l": p.linea_id, "p": p.planilla_template_id,
          "al": p.alcance, "t": p.texto, "ac": p.accion_sugerida,
@@ -1489,9 +1693,9 @@ async def resolver_observacion(
     await db.execute(
         text(
             """UPDATE planificacion.observacion
-                  SET estado = CAST(:est AS planificacion.observacion_estado),
+                  SET estado = :est,
                       resuelta_por = :uid,
-                      resuelta_at = now(),
+                      resuelta_at = SYSDATETIMEOFFSET(),
                       resolucion_comentario = :rc
                 WHERE id = :o"""
         ),

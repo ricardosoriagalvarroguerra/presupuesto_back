@@ -10,9 +10,8 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 settings = get_settings()
-# Usamos `sync_dsn` (no `database_url_sync` raw) para que Alembic funcione
-# tanto en local (DSN explícito en .env) como en Railway (donde se deriva
-# automáticamente del DATABASE_URL público).
+# `sync_dsn` resuelve un DSN pyodbc tanto desde un DATABASE_URL_SYNC explícito
+# (override del operador) como derivado automáticamente desde DATABASE_URL.
 config.set_main_option("sqlalchemy.url", settings.sync_dsn)
 
 target_metadata = None  # set when ORM models are wired in
@@ -25,7 +24,9 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         include_schemas=True,
-        version_table_schema="public",
+        # SQL Server: la tabla alembic_version vive en el schema `dbo` por default
+        # (sin necesidad de un schema neutro como `public` en PG).
+        version_table_schema="dbo",
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -42,7 +43,7 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             include_schemas=True,
-            version_table_schema="public",
+            version_table_schema="dbo",
         )
         with context.begin_transaction():
             context.run_migrations()

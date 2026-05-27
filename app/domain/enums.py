@@ -1,7 +1,6 @@
 """Enums compartidos del dominio de planificación.
 
-Single source of truth para los estados del workflow, antes hardcodeados como
-strings literales en 20+ lugares. El frontend tiene un mirror en
+  El frontend tiene un mirror en
 `frontend/src/domain/enums.ts` que debe mantenerse en sincronía.
 
 Workflow vigente (migración 030):

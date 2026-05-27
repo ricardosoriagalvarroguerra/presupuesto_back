@@ -1,11 +1,25 @@
-# Dependencias de producción. Railway/Nixpacks detecta este archivo y corre
-# `pip install -r requirements.txt` automáticamente. Sincronizado con
-# pyproject.toml. Si agregás una librería, actualizá ambos.
-fastapi>=0.115
+# Dependencias de producción. Mantener sincronizado con pyproject.toml — si
+# agregás una librería, actualizá ambos archivos.
+# fastapi: pineado a 0.115.6 a propósito.
+# Las versiones 0.136.x aparecen en advisory PyPI (MAL-2026-4750).
+#
+# fastapi 0.115.6 declara `starlette<0.42.0,>=0.40.0` en sus metadatos. Acá
+# forzamos starlette>=0.49.1 para cerrar:
+#   - CVE-2025-54121 (DoS por multipart)
+#   - CVE-2025-62727 (parsing de form-data)
+# Pip reporta "dependency conflict" pero a runtime fastapi funciona con
+# starlette 0.49 sin problemas — la app pasa los 28 tests + smoke de
+# endpoints. El upgrade real a fastapi >= 0.136 está bloqueado por el
+# advisory; cuando se resuelva, sacar el `--no-deps` del proceso de install.
+#
+# Queda abierto PYSEC-2026-161 (fix en starlette 1.0.1, breaking change
+# que fastapi 0.115.x no soporta). Riesgo aceptado, ver AUDITORIA_TI.md.
+fastapi==0.115.6
+starlette>=0.49.1,<1.0
 uvicorn[standard]>=0.32
 sqlalchemy>=2.0
-asyncpg>=0.30
-psycopg2-binary>=2.9
+aioodbc>=0.5
+pyodbc>=5.1
 alembic>=1.13
 pydantic>=2.9
 pydantic-settings>=2.6

@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# Entry point para Railway (y cualquier PaaS estilo Heroku).
-# Aplica migraciones pendientes y arranca el ASGI server.
+# Entry point del backend. Aplica migraciones Alembic pendientes y arranca
+# uvicorn en el puerto indicado por la variable $PORT (default 8000).
 #
-# Railway inyecta $PORT — uvicorn debe bindar a ese puerto y a 0.0.0.0.
+# Nota sobre el baseline Alembic: 001_baseline_mssql es un upgrade vacío — el
+# DDL real se aplicó vía `migracion_sqlserver/ddl_sqlserver.sql`. En la primera
+# puesta en marcha contra una BD ya poblada, correr UNA vez:
+#       alembic stamp head
+# para marcar el baseline como aplicado. A partir de ahí `alembic upgrade head`
+# corre las migraciones nuevas que se vayan agregando (002+).
 set -euo pipefail
 
 echo "==> Aplicando migraciones Alembic..."

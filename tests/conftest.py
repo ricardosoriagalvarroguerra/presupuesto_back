@@ -30,17 +30,18 @@ async def _desactivar_requiere_cambio_password_para_test_users():
     (forzar reset al primer login). En tests eso bloquearía cualquier
     operación detrás del wizard. Apagamos el flag para los usuarios que los
     tests usan (idempotente; no toca al resto)."""
-    from sqlalchemy import text
+    from sqlalchemy import bindparam, text
     from app.db import SessionLocal
 
     USUARIOS_DE_TEST = ["mmednik", "vmoreira", "lbotafogo", "mcalvino", "ajustiniano"]
     async with SessionLocal() as db:
-        await db.execute(
-            text("""UPDATE core.usuario
-                    SET requiere_cambio_password = false
-                    WHERE username = ANY(:u)"""),
-            {"u": USUARIOS_DE_TEST},
+        # MSSQL: `ANY(:array)` no existe; usamos `IN :u` con bindparam expanding.
+        stmt = text("""UPDATE core.usuario
+                       SET requiere_cambio_password = 0
+                       WHERE username IN :u""").bindparams(
+            bindparam("u", expanding=True)
         )
+        await db.execute(stmt, {"u": USUARIOS_DE_TEST})
         await db.commit()
     yield
 

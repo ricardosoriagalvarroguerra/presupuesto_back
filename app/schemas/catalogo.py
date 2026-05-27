@@ -62,3 +62,6 @@ class PlanillaTemplateOut(_ORM):
     columnas_visibles: list[dict[str, Any]]
     reglas_validacion: dict[str, Any] | None
     orden: int
+    # Marca planillas institucionales con dueño único (cargables solo por
+    # usuarios con esa planilla en `planillas_extra`). Ver authz.py::puede_acceder_planilla.
+    solo_cross_vp: bool = False

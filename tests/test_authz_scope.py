@@ -1,13 +1,3 @@
-"""Tests de autorización por scope (cross-VP).
-
-Estos son los tests que cierran la regresión más grave que detectamos hoy:
-un usuario VPD no debe poder ver ni modificar solicitudes VPF. Si estos
-tests pasan, el aislamiento por scope sigue intacto.
-
-Crea su propia solicitud VPF descartable (ciclo 2096) — antes dependía de la
-#13 sembrada manualmente, lo cual rompía si alguien la borraba para hacer
-pruebas (es lo que pasó).
-"""
 import pytest
 import pytest_asyncio
 from sqlalchemy import text
@@ -20,12 +10,17 @@ async def SID_VPF():
     from app.db import SessionLocal
     async with SessionLocal() as db:
         await db.execute(text("""
-            DELETE FROM planificacion.solicitud
-            WHERE ciclo_id IN (SELECT id FROM core.ciclo_presupuestario WHERE anio=2096)
+            DELETE FROM planificacion.evento_solicitud WHERE solicitud_id IN (SELECT s.id FROM planificacion.solicitud s JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2096);
+            DELETE FROM planificacion.linea_solicitud WHERE solicitud_id IN (SELECT s.id FROM planificacion.solicitud s JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2096);
+            DELETE FROM planificacion.snapshot_linea WHERE snapshot_id IN (SELECT ss.id FROM planificacion.snapshot_solicitud ss JOIN planificacion.solicitud s ON s.id=ss.solicitud_id JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2096);
+            DELETE FROM planificacion.snapshot_solicitud WHERE solicitud_id IN (SELECT s.id FROM planificacion.solicitud s JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2096);
+            DELETE FROM planificacion.observacion WHERE solicitud_id IN (SELECT s.id FROM planificacion.solicitud s JOIN core.ciclo_presupuestario cp ON cp.id=s.ciclo_id WHERE cp.anio=2096);
+            DELETE FROM planificacion.solicitud WHERE ciclo_id IN (SELECT id FROM core.ciclo_presupuestario WHERE anio=2096)
         """))
         await db.execute(text("DELETE FROM core.ciclo_presupuestario WHERE anio=2096"))
         await db.execute(text("""
             INSERT INTO core.ciclo_presupuestario (anio, nombre, estado, created_by)
+            OUTPUT INSERTED.id
             VALUES (2096, 'Ciclo 2096 (test scope)', 'planificacion',
                    (SELECT id FROM core.usuario WHERE username='mmednik'))
         """))
@@ -35,15 +30,20 @@ async def SID_VPF():
         sid = (await db.execute(text("""
             INSERT INTO planificacion.solicitud
               (ciclo_id, vp_codigo, nombre, etapa_actual, estado_workflow, created_by)
+            OUTPUT INSERTED.id
             VALUES (:c, 'VPF', 'Test scope cross-VP', 0, 'en_elaboracion',
                    (SELECT id FROM core.usuario WHERE username='mmednik'))
-            RETURNING id
         """), {"c": cid})).scalar()
         await db.commit()
 
     yield sid
 
     async with SessionLocal() as db:
+        await db.execute(text("DELETE FROM planificacion.evento_solicitud WHERE solicitud_id=:s"), {"s": sid})
+        await db.execute(text("DELETE FROM planificacion.snapshot_linea WHERE snapshot_id IN (SELECT id FROM planificacion.snapshot_solicitud WHERE solicitud_id=:s)"), {"s": sid})
+        await db.execute(text("DELETE FROM planificacion.snapshot_solicitud WHERE solicitud_id=:s"), {"s": sid})
+        await db.execute(text("DELETE FROM planificacion.observacion WHERE solicitud_id=:s"), {"s": sid})
+        await db.execute(text("DELETE FROM planificacion.linea_solicitud WHERE solicitud_id=:s"), {"s": sid})
         await db.execute(text("DELETE FROM planificacion.solicitud WHERE id=:s"), {"s": sid})
         await db.execute(text("DELETE FROM core.ciclo_presupuestario WHERE anio=2096"))
         await db.commit()

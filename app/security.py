@@ -1,9 +1,15 @@
-"""JWT + dependency `get_current_user` para FastAPI.
+"""JWT firmado + dependency `get_current_user` que usan los endpoints protegidos.
 
-Source of truth de autenticación: el header `Authorization: Bearer <jwt>` es
-validado en cada request protegida. Hasta hoy el backend confiaba en el
-`usuario_id` del payload (suplantación trivial); con esto, ese campo se
-ignora — la identidad viene del token firmado.
+Regla central: la identidad siempre se lee del header `Authorization: Bearer
+<jwt>`. El JWT está firmado con `app_secret_key`; cualquier modificación
+invalida la firma. Extraemos `sub` (= usuario_id) del payload — los schemas
+Pydantic siguen aceptando un campo `usuario_id` por compat, pero el backend
+lo ignora.
+
+Dos dependencias públicas:
+  - `get_current_user`             → exige scope='full'. Para todos los endpoints.
+  - `get_current_user_any_scope`   → acepta también 'pwd_change'. Solo para
+                                     /auth/cambiar-password y /auth/me.
 """
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -27,7 +33,14 @@ def create_access_token(
     extra_claims: dict[str, Any] | None = None,
     expires_minutes: int | None = None,
 ) -> str:
-    """Firma un JWT con sub=usuario_id, email y claims adicionales (roles, vp)."""
+    """Genera un JWT firmado con HS256 (claves simétricas).
+
+    Los claims estándar (sub, iat, exp) los pone la función. Los específicos
+    del proyecto (vp, roles, scope) los pasa el caller en `extra_claims`. La
+    expiración default sale de `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` (8 horas);
+    `expires_minutes` se usa para tokens de scope reducido (15 min en el
+    caso de pwd_change).
+    """
     settings = get_settings()
     exp_minutes = expires_minutes or settings.jwt_access_token_expire_minutes
     now = datetime.now(timezone.utc)
@@ -43,6 +56,12 @@ def create_access_token(
 
 
 def decode_token(token: str) -> dict[str, Any]:
+    """Valida firma + expiración. Si algo falla → 401 con mensaje genérico.
+
+    El mensaje "Token inválido o expirado" es deliberadamente vago — no
+    distingue entre firma incorrecta, token expirado o token malformado.
+    Mismo principio que el "Usuario o contraseña inválidos" del login.
+    """
     settings = get_settings()
     try:
         return jwt.decode(token, settings.app_secret_key, algorithms=[settings.jwt_algorithm])
@@ -50,7 +69,7 @@ def decode_token(token: str) -> dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Token inválido o expirado",
-            headers={"WWW-Authenticate": "Bearer"},
+            headers={"WWW-Authenticate": "Bearer realm=\"presupuesto-fonplata\""},
         ) from e
 
 
@@ -91,7 +110,7 @@ async def _resolve_current_user(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Autenticación requerida",
-            headers={"WWW-Authenticate": "Bearer"},
+            headers={"WWW-Authenticate": "Bearer realm=\"presupuesto-fonplata\""},
         )
     claims = decode_token(creds.credentials)
     try:
@@ -99,20 +118,26 @@ async def _resolve_current_user(
     except (KeyError, TypeError, ValueError) as e:
         raise HTTPException(401, "Token sin sub válido") from e
 
+    # MSSQL no tiene `array_agg` ni `FILTER (WHERE ...)`. Agregamos roles con
+    # STRING_AGG (SQL Server 2017+) y parseamos en Python; los nulos se filtran
+    # con `WHERE r.codigo IS NOT NULL` antes del agregado (subquery).
     row = (await db.execute(
         text("""
             SELECT u.id, u.email, u.username, u.vp_codigo, u.ver_todo, u.estado,
-                   COALESCE(array_agg(r.codigo) FILTER (WHERE r.codigo IS NOT NULL), '{}') AS roles
+                   (SELECT STRING_AGG(r.codigo, ',')
+                    FROM core.usuario_rol ur
+                    JOIN core.rol r ON r.id = ur.rol_id
+                    WHERE ur.usuario_id = u.id) AS roles
             FROM core.usuario u
-            LEFT JOIN core.usuario_rol ur ON ur.usuario_id = u.id
-            LEFT JOIN core.rol r ON r.id = ur.rol_id
             WHERE u.id = :u
-            GROUP BY u.id
         """),
         {"u": uid},
     )).mappings().first()
     if not row or row["estado"] != "activo":
         raise HTTPException(401, "Usuario inválido o inactivo")
+    roles_list: list[str] = []
+    if row["roles"]:
+        roles_list = [r for r in row["roles"].split(",") if r]
 
     extras = (await db.execute(
         text("SELECT planilla_codigo FROM core.usuario_planilla_extra WHERE usuario_id=:u"),
@@ -125,7 +150,7 @@ async def _resolve_current_user(
         username=row["username"],
         vp_codigo=row["vp_codigo"],
         ver_todo=row["ver_todo"],
-        roles=list(row["roles"] or []),
+        roles=roles_list,
         planillas_extra=list(extras),
         scope=(claims.get("scope") or "full"),
     )
