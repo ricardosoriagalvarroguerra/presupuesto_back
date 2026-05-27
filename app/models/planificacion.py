@@ -296,8 +296,13 @@ class SnapshotSolicitud(Base):
     )
     etapa: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     motivo: Mapped[str] = mapped_column(
-        Enum("enviado_a_revision", "devuelto_con_observaciones", "reaprobado_post_ajustes",
-             "aprobado_objetivos", "aprobado_presidencia", "aprobado_directorio", "cerrado",
+        # Debe mantenerse sincronizado con CK_snapshot_solicitud_motivo_enum
+        # en ddl_sqlserver.sql. La forma `enviado_revision` (sin `_a_`) es
+        # legacy del enum PG original; `aprobar_presidencia` reusa
+        # `aprobado_directorio` como "aprobado por autoridad superior"
+        # (ver comentario en api/solicitudes.py:1182).
+        Enum("enviado_revision", "devuelto_con_observaciones",
+             "reaprobado_post_ajustes", "aprobado_directorio",
              name="snapshot_motivo", schema="planificacion"),
         nullable=False,
     )
