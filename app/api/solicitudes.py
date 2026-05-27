@@ -1502,6 +1502,17 @@ class ObservacionResolver(BaseModel):
     usuario_id: int | None = None  # deprecado — JWT manda
 
 
+class ObservacionRespuestaCrear(BaseModel):
+    """Mensaje dentro del hilo de una observación abierta.
+
+    No cambia el estado de la observación — eso lo sigue haciendo PATCH
+    /observaciones/{oid} con aplicar/rechazar. Esto es el canal de
+    conversación VP ↔ revisor mientras la obs todavía está en discusión.
+    """
+    model_config = {"extra": "forbid"}
+    texto: str = Field(min_length=1, max_length=4000)
+
+
 @router.post("/solicitudes/{sid}/observaciones")
 async def crear_observacion(
     sid: int,
@@ -1798,4 +1809,454 @@ async def eliminar_adjunto(
     )
     await db.commit()
     return {"id": aid, "deleted": True}
+
+
+# ============================================================
+# Timeline por línea — cronología del ajuste
+# ============================================================
+
+@router.get("/lineas/{lid}/historia")
+async def historia_linea(
+    lid: int,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """Cronología tipada de todo lo que pasó con una línea.
+
+    Mergea tres fuentes:
+      1. `evento_solicitud` filtrado por `linea_id` (modificaciones, transiciones
+         que afectaron la línea, crear/aplicar/rechazar observaciones sobre ella).
+      2. Observaciones cuyo `linea_id` apunta a esta línea (incluyendo el alta).
+      3. Respuestas a esas observaciones (mensajes del hilo).
+
+    El resultado viene ordenado por `created_at` ASC para mostrar como timeline.
+    No reconstruye "valor anterior" de cada cambio — el frontend lo computa
+    plegando el payload de cada evento sobre el estado de la línea.
+    """
+    ok, vp_sol = await puede_acceder_linea(db, current.id, lid)
+    if vp_sol is None:
+        raise HTTPException(404, "línea no existe")
+    if not ok:
+        raise HTTPException(403, f"Tu rol no puede ver la historia de líneas de {vp_sol}.")
+
+    # 1. Eventos atados directamente a la línea.
+    eventos = (await db.execute(
+        text(
+            """SELECT e.id, e.accion, e.etapa_anterior, e.etapa_nueva,
+                      e.estado_anterior, e.estado_nuevo, e.payload, e.comentario,
+                      e.created_at,
+                      u.id AS uid, u.nombre AS unombre, u.apellido AS uapellido
+                 FROM planificacion.evento_solicitud e
+                 LEFT JOIN core.usuario u ON u.id = e.usuario_id
+                WHERE e.linea_id = :l
+                ORDER BY e.created_at ASC"""
+        ),
+        {"l": lid},
+    )).mappings().all()
+
+    # 2. Observaciones de esta línea (info estática: texto, sugerencia, estado).
+    obs = (await db.execute(
+        text(
+            """SELECT o.id, o.alcance, o.texto, o.accion_sugerida, o.valor_sugerido,
+                      o.estado, o.etapa_origen, o.created_at, o.resuelta_at, o.resolucion_comentario,
+                      uc.id AS uc_id, uc.nombre AS uc_nombre, uc.apellido AS uc_apellido,
+                      ur.id AS ur_id, ur.nombre AS ur_nombre, ur.apellido AS ur_apellido
+                 FROM planificacion.observacion o
+                 LEFT JOIN core.usuario uc ON uc.id = o.created_by
+                 LEFT JOIN core.usuario ur ON ur.id = o.resuelta_por
+                WHERE o.linea_id = :l
+                ORDER BY o.created_at ASC"""
+        ),
+        {"l": lid},
+    )).mappings().all()
+    obs_by_id = {o["id"]: dict(o) for o in obs}
+
+    # 3. Respuestas dentro del hilo de cada observación de esta línea.
+    respuestas = []
+    if obs_by_id:
+        respuestas = (await db.execute(
+            text(
+                """SELECT r.id, r.observacion_id, r.texto, r.created_at,
+                          u.id AS uid, u.nombre AS unombre, u.apellido AS uapellido
+                     FROM planificacion.observacion_respuesta r
+                     LEFT JOIN core.usuario u ON u.id = r.autor_id
+                    WHERE r.observacion_id IN :oids
+                    ORDER BY r.created_at ASC"""
+            ).bindparams(bindparam("oids", expanding=True)),
+            {"oids": list(obs_by_id.keys())},
+        )).mappings().all()
+
+    timeline: list[dict[str, Any]] = []
+
+    for e in eventos:
+        # El payload viene como JSON serializado (NVARCHAR(MAX)).
+        try:
+            pl = json.loads(e["payload"]) if e["payload"] else {}
+        except (TypeError, ValueError):
+            pl = {}
+        timeline.append({
+            "kind": "evento",
+            "id": e["id"],
+            "accion": e["accion"],
+            "etapa_anterior": e["etapa_anterior"],
+            "etapa_nueva": e["etapa_nueva"],
+            "estado_anterior": e["estado_anterior"],
+            "estado_nuevo": e["estado_nuevo"],
+            "payload": pl,
+            "comentario": e["comentario"],
+            "created_at": e["created_at"].isoformat() if e["created_at"] else None,
+            "usuario": (
+                {"id": e["uid"], "nombre": e["unombre"], "apellido": e["uapellido"]}
+                if e["uid"] else None
+            ),
+        })
+
+    for o in obs:
+        try:
+            vs = json.loads(o["valor_sugerido"]) if isinstance(o["valor_sugerido"], str) else (o["valor_sugerido"] or {})
+        except (TypeError, ValueError):
+            vs = {}
+        timeline.append({
+            "kind": "observacion",
+            "id": o["id"],
+            "observacion_id": o["id"],
+            "alcance": o["alcance"],
+            "texto": o["texto"],
+            "accion_sugerida": o["accion_sugerida"],
+            "valor_sugerido": vs,
+            "estado": o["estado"],
+            "etapa_origen": o["etapa_origen"],
+            "created_at": o["created_at"].isoformat() if o["created_at"] else None,
+            "resuelta_at": o["resuelta_at"].isoformat() if o["resuelta_at"] else None,
+            "resolucion_comentario": o["resolucion_comentario"],
+            "usuario": (
+                {"id": o["uc_id"], "nombre": o["uc_nombre"], "apellido": o["uc_apellido"]}
+                if o["uc_id"] else None
+            ),
+            "resuelta_por": (
+                {"id": o["ur_id"], "nombre": o["ur_nombre"], "apellido": o["ur_apellido"]}
+                if o["ur_id"] else None
+            ),
+        })
+
+    for r in respuestas:
+        timeline.append({
+            "kind": "respuesta",
+            "id": r["id"],
+            "observacion_id": r["observacion_id"],
+            "texto": r["texto"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "usuario": (
+                {"id": r["uid"], "nombre": r["unombre"], "apellido": r["uapellido"]}
+                if r["uid"] else None
+            ),
+        })
+
+    # Orden global por created_at — los empates se rompen por kind para que el
+    # "crear_observacion" del evento quede al lado de la entrada "observacion".
+    timeline.sort(key=lambda x: (x["created_at"] or "", x["kind"]))
+    return timeline
+
+
+# ============================================================
+# Diff entre dos snapshots cualesquiera (o snapshot vs actual)
+# ============================================================
+
+@router.get("/solicitudes/{sid}/diff")
+async def diff_solicitud(
+    sid: int,
+    frm: int | None = Query(None, alias="from", description="snapshot_id base"),
+    to: int | str = Query("current", description="snapshot_id o literal 'current'"),
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Computa diff de líneas entre dos versiones de la solicitud.
+
+    `from` = snapshot_id (obligatorio salvo que el frontend ya lo conozca por
+    listar /snapshots). `to` = otro snapshot_id, o el literal "current" para
+    comparar contra el estado vivo de la solicitud.
+
+    Devuelve `{ from, to, lineas: [...], totales: {...} }` donde cada línea
+    es `{ key, tipo: agregada|eliminada|modificada, item_codigo, cuenta_codigo,
+    monto_antes, monto_ahora, parametros_antes, parametros_ahora }`.
+
+    La lógica de diff vivía duplicada en `PanelCambios.tsx`. Centralizarla acá
+    permite reusarla para la vista two-pane y exportes futuros.
+    """
+    ok, vp_sol = await puede_acceder_solicitud(db, current.id, sid)
+    if vp_sol is None:
+        raise HTTPException(404, "solicitud no existe")
+    if not ok:
+        raise HTTPException(403, f"Tu rol no puede ver diffs de solicitudes de {vp_sol}.")
+    if frm is None:
+        raise HTTPException(400, "parámetro 'from' (snapshot_id) requerido")
+
+    # Validar que el snapshot 'from' pertenece a esta solicitud.
+    base = (await db.execute(
+        text(
+            """SELECT id, etapa, motivo, monto_total, created_at,
+                      (SELECT COUNT(*) FROM planificacion.snapshot_linea sl WHERE sl.snapshot_id = s.id) AS n_lineas
+                 FROM planificacion.snapshot_solicitud s
+                WHERE s.id = :sn AND s.solicitud_id = :s"""
+        ),
+        {"sn": frm, "s": sid},
+    )).mappings().first()
+    if not base:
+        raise HTTPException(404, "snapshot 'from' no existe o no pertenece a la solicitud")
+
+    lineas_from = (await db.execute(
+        text(
+            """SELECT linea_id, item_codigo, cuenta_codigo, plan_codigo,
+                      parametros, monto_solicitado, justificacion
+                 FROM planificacion.snapshot_linea WHERE snapshot_id = :sn"""
+        ),
+        {"sn": frm},
+    )).mappings().all()
+    lineas_from = [dict(r) for r in lineas_from]
+
+    # 'to' puede ser otro snapshot o el estado actual.
+    target_meta: dict[str, Any]
+    lineas_to: list[dict[str, Any]]
+    if to == "current" or to == "actual":
+        rows = (await db.execute(
+            text(
+                """SELECT l.id AS linea_id,
+                          i.codigo AS item_codigo, c.codigo AS cuenta_codigo,
+                          p.codigo AS plan_codigo,
+                          l.parametros, l.monto_solicitado, l.justificacion
+                     FROM planificacion.linea_solicitud l
+                     LEFT JOIN catalogo.item_planificacion i ON i.id = l.item_id
+                     LEFT JOIN catalogo.cuenta_planificacion c ON c.id = l.cuenta_id
+                     LEFT JOIN catalogo.plan_presupuestario p ON p.id = l.plan_id
+                    WHERE l.solicitud_id = :s"""
+            ),
+            {"s": sid},
+        )).mappings().all()
+        lineas_to = [dict(r) for r in rows]
+        target_meta = {"id": "current", "label": "Estado actual"}
+    else:
+        try:
+            to_id = int(to)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "parámetro 'to' debe ser snapshot_id o 'current'")
+        snap_to = (await db.execute(
+            text(
+                """SELECT id, etapa, motivo, monto_total, created_at
+                     FROM planificacion.snapshot_solicitud
+                    WHERE id = :sn AND solicitud_id = :s"""
+            ),
+            {"sn": to_id, "s": sid},
+        )).mappings().first()
+        if not snap_to:
+            raise HTTPException(404, "snapshot 'to' no existe o no pertenece a la solicitud")
+        rows = (await db.execute(
+            text(
+                """SELECT linea_id, item_codigo, cuenta_codigo, plan_codigo,
+                          parametros, monto_solicitado, justificacion
+                     FROM planificacion.snapshot_linea WHERE snapshot_id = :sn"""
+            ),
+            {"sn": to_id},
+        )).mappings().all()
+        lineas_to = [dict(r) for r in rows]
+        target_meta = dict(snap_to)
+        if target_meta.get("created_at"):
+            target_meta["created_at"] = target_meta["created_at"].isoformat()
+
+    def parse_params(p: Any) -> dict[str, Any]:
+        if p is None:
+            return {}
+        if isinstance(p, str):
+            try:
+                return json.loads(p)
+            except (TypeError, ValueError):
+                return {}
+        if isinstance(p, dict):
+            return p
+        return {}
+
+    # Indexamos por linea_id cuando está disponible (los snapshots viejos pueden
+    # tener filas con linea_id=NULL si la línea fue borrada después).
+    from_by_id = {r["linea_id"]: r for r in lineas_from if r["linea_id"] is not None}
+    to_by_id = {r["linea_id"]: r for r in lineas_to if r["linea_id"] is not None}
+
+    diffs: list[dict[str, Any]] = []
+    seen_to: set[int] = set()
+    total_from = 0.0
+    total_to = 0.0
+
+    for fr in lineas_from:
+        total_from += float(fr.get("monto_solicitado") or 0)
+
+    for tr in lineas_to:
+        total_to += float(tr.get("monto_solicitado") or 0)
+
+    # 1) Modificadas / sin cambio: las que están en ambos.
+    for lid, fr in from_by_id.items():
+        tr = to_by_id.get(lid)
+        if tr is None:
+            continue
+        seen_to.add(lid)
+        antes = float(fr.get("monto_solicitado") or 0)
+        ahora = float(tr.get("monto_solicitado") or 0)
+        pa = parse_params(fr.get("parametros"))
+        pn = parse_params(tr.get("parametros"))
+        params_changed = sorted({k for k in (set(pa) | set(pn)) if str(pa.get(k, "")) != str(pn.get(k, ""))})
+        params_changed = [k for k in params_changed if k not in ("concepto", "grupo_id")]
+        if abs(antes - ahora) < 0.01 and not params_changed:
+            continue
+        diffs.append({
+            "key": f"mod-{lid}",
+            "tipo": "modificada",
+            "linea_id": lid,
+            "item_codigo": tr.get("item_codigo") or fr.get("item_codigo"),
+            "cuenta_codigo": tr.get("cuenta_codigo") or fr.get("cuenta_codigo"),
+            "monto_antes": antes,
+            "monto_ahora": ahora,
+            "parametros_antes": pa,
+            "parametros_ahora": pn,
+            "parametros_cambiados": params_changed,
+        })
+
+    # 2) Agregadas: están en 'to' pero no en 'from'.
+    for lid, tr in to_by_id.items():
+        if lid in seen_to:
+            continue
+        diffs.append({
+            "key": f"add-{lid}",
+            "tipo": "agregada",
+            "linea_id": lid,
+            "item_codigo": tr.get("item_codigo"),
+            "cuenta_codigo": tr.get("cuenta_codigo"),
+            "monto_antes": None,
+            "monto_ahora": float(tr.get("monto_solicitado") or 0),
+            "parametros_antes": None,
+            "parametros_ahora": parse_params(tr.get("parametros")),
+            "parametros_cambiados": [],
+        })
+
+    # 3) Eliminadas: están en 'from' pero no en 'to'.
+    for lid, fr in from_by_id.items():
+        if lid in to_by_id:
+            continue
+        diffs.append({
+            "key": f"del-{lid}",
+            "tipo": "eliminada",
+            "linea_id": lid,
+            "item_codigo": fr.get("item_codigo"),
+            "cuenta_codigo": fr.get("cuenta_codigo"),
+            "monto_antes": float(fr.get("monto_solicitado") or 0),
+            "monto_ahora": None,
+            "parametros_antes": parse_params(fr.get("parametros")),
+            "parametros_ahora": None,
+            "parametros_cambiados": [],
+        })
+
+    base_meta = dict(base)
+    if base_meta.get("created_at"):
+        base_meta["created_at"] = base_meta["created_at"].isoformat()
+
+    return {
+        "solicitud_id": sid,
+        "from": base_meta,
+        "to": target_meta,
+        "lineas": diffs,
+        "totales": {
+            "monto_antes": total_from,
+            "monto_ahora": total_to,
+            "delta": total_to - total_from,
+            "n_agregadas": sum(1 for d in diffs if d["tipo"] == "agregada"),
+            "n_eliminadas": sum(1 for d in diffs if d["tipo"] == "eliminada"),
+            "n_modificadas": sum(1 for d in diffs if d["tipo"] == "modificada"),
+        },
+    }
+
+
+# ============================================================
+# Hilo de respuestas en observaciones
+# ============================================================
+
+@router.post("/observaciones/{oid}/respuestas")
+async def crear_respuesta_observacion(
+    oid: int,
+    p: ObservacionRespuestaCrear,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Agrega un mensaje al hilo de una observación.
+
+    Acceso: cualquier usuario con acceso a la solicitud puede responder.
+    Estado: no cambia el estado de la observación. Para cerrarla seguís usando
+    PATCH /observaciones/{oid} con aplicar/rechazar.
+    """
+    obs = (await db.execute(
+        text("SELECT id, solicitud_id, linea_id FROM planificacion.observacion WHERE id=:o"),
+        {"o": oid},
+    )).mappings().first()
+    if not obs:
+        raise HTTPException(404, "observación no existe")
+    ok, vp_sol = await puede_acceder_solicitud(db, current.id, obs["solicitud_id"])
+    if not ok:
+        raise HTTPException(403, f"Tu rol no puede responder observaciones de solicitudes de {vp_sol}.")
+
+    texto = p.texto.strip()
+    if not texto:
+        raise HTTPException(400, "texto vacío")
+
+    rid = (await db.execute(
+        text(
+            """INSERT INTO planificacion.observacion_respuesta
+                  (observacion_id, autor_id, texto)
+               OUTPUT INSERTED.id
+               VALUES (:o, :u, :t)"""
+        ),
+        {"o": oid, "u": current.id, "t": texto},
+    )).scalar()
+
+    # No usamos una accion nueva en el enum evento_accion para no requerir
+    # migración del CHECK constraint; el hilo es un canal de comunicación y
+    # ya queda auditado en observacion_respuesta (append-only por diseño).
+    await db.commit()
+    return {"id": rid, "observacion_id": oid}
+
+
+@router.get("/observaciones/{oid}/respuestas")
+async def listar_respuestas_observacion(
+    oid: int,
+    current: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    obs = (await db.execute(
+        text("SELECT id, solicitud_id FROM planificacion.observacion WHERE id=:o"),
+        {"o": oid},
+    )).mappings().first()
+    if not obs:
+        raise HTTPException(404, "observación no existe")
+    ok, vp_sol = await puede_acceder_solicitud(db, current.id, obs["solicitud_id"])
+    if not ok:
+        raise HTTPException(403, f"Tu rol no puede ver respuestas de solicitudes de {vp_sol}.")
+
+    rows = (await db.execute(
+        text(
+            """SELECT r.id, r.texto, r.created_at,
+                      u.id AS uid, u.nombre AS unombre, u.apellido AS uapellido,
+                      u.vp_codigo AS uvp
+                 FROM planificacion.observacion_respuesta r
+                 LEFT JOIN core.usuario u ON u.id = r.autor_id
+                WHERE r.observacion_id = :o
+                ORDER BY r.created_at ASC"""
+        ),
+        {"o": oid},
+    )).mappings().all()
+    return [
+        {
+            "id": r["id"],
+            "texto": r["texto"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "autor": (
+                {"id": r["uid"], "nombre": r["unombre"], "apellido": r["uapellido"], "vp_codigo": r["uvp"]}
+                if r["uid"] else None
+            ),
+        }
+        for r in rows
+    ]
 

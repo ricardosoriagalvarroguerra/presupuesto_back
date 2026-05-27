@@ -233,6 +233,31 @@ class Observacion(Base):
     resolucion_comentario: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     solicitud: Mapped[Solicitud] = relationship(back_populates="observaciones")
+    respuestas: Mapped[list["ObservacionRespuesta"]] = relationship(
+        back_populates="observacion", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+# ============================================================================
+# Respuestas a observaciones (hilo VP ↔ Presidencia dentro de una obs abierta)
+# ============================================================================
+class ObservacionRespuesta(Base):
+    __tablename__ = "observacion_respuesta"
+    __table_args__ = {"schema": "planificacion"}
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    observacion_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("planificacion.observacion.id", ondelete="CASCADE"), nullable=False
+    )
+    autor_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("core.usuario.id", ondelete="SET NULL"), nullable=True
+    )
+    texto: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("SYSDATETIMEOFFSET()"), nullable=False
+    )
+
+    observacion: Mapped[Observacion] = relationship(back_populates="respuestas")
 
 
 # ============================================================================
